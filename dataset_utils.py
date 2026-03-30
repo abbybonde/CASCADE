@@ -1,3 +1,34 @@
+"""
+dataset_utils.py
+================
+Data I/O, synthetic Raman data generation, and wavelet transform utilities for CASCADE.
+
+Public API
+----------
+load_h5_file            Load BCARS hyperspectral data from an HDF5 file.
+save_h5_file            Write fit results back to HDF5.
+voigt_peak              Absorptive or dispersive Voigt peak profile (requires scipy).
+generate_multipeak_Raman  Synthesise a spectrum from a list of Voigt peaks.
+lorentz4_wavelet          Single Lorentz4 wavelet kernel.
+mexican_hat_wavelet        Single Mexican Hat wavelet kernel.
+dispersive_lorentzian_wavelet  Dispersive Lorentzian wavelet kernel.
+multiscale_lorentz4_transform  CWT with Lorentz4 wavelets (NumPy, used in RamanDataset).
+multiscale_mexhat_transform    CWT with Mexican Hat wavelets (NumPy).
+cwt_dispersive_lorentzian      CWT with dispersive Lorentzian wavelets.
+multiscale_anisotropic_target  2-D (scale × position) training target for one peak.
+RamanDataset            PyTorch Dataset of synthetic Raman spectra with GT peak params.
+SampleWrapper           Named-attribute wrapper around RamanDataset tuple samples.
+dataset_from_curriculum_stage  Build a RamanDataset from a curriculum config dict.
+raman_collate_fn        DataLoader collation for variable-length peak lists.
+
+Optional dependencies (imported lazily; only required for specific features)
+--------------------------------------------------------------------------
+mswt_peak_priors        — required when RamanDataset(return_priors=True)
+model_defs              — required when RamanDataset(return_pipeline_estimates=True)
+post_UNet_utils         — required when RamanDataset(return_pipeline_estimates=True)
+utils_wavelet_geometry  — required when RamanDataset(return_pipeline_estimates=True)
+"""
+
 from math import gamma
 
 import numpy as np
@@ -242,6 +273,22 @@ def voigt_peak(x, center, amp, sigma, gamma=5.0, Real=False):
 
 
 def generate_multipeak_Raman(x, centers, amps, sigmas, gammas, noise_std=0.0, Real=False):
+    """Synthesise a multi-peak Raman spectrum as a sum of Voigt profiles.
+
+    Parameters
+    ----------
+    x         : (n_pts,) spectral axis
+    centers   : (n_peaks,) peak centre positions (same units as x)
+    amps      : (n_peaks,) peak amplitudes
+    sigmas    : (n_peaks,) Gaussian half-widths
+    gammas    : (n_peaks,) or scalar Lorentzian half-widths
+    noise_std : standard deviation of additive Gaussian noise; 0.0 → noiseless
+    Real      : if True use dispersive (imaginary) Voigt profiles, else absorptive
+
+    Returns
+    -------
+    y : (n_pts,) float32 spectrum
+    """
     x = np.asarray(x, dtype=np.float32)
     centers = np.asarray(centers)
     amps = np.asarray(amps)
@@ -261,6 +308,24 @@ def generate_multipeak_Raman(x, centers, amps, sigmas, gammas, noise_std=0.0, Re
 
 
 def lorentz4_wavelet(a, dx=1.0, support_factor=8):
+    """Build a normalised Lorentz4 wavelet kernel at scale *a*.
+
+    The Lorentz4 (4th-order Lorentzian derivative) is:
+        ψ(t) = (1 - 6t² + t⁴) / (1 + t²)⁴,   t = x / a
+
+    It is L2-normalised so that FFT cross-correlation amplitudes are
+    comparable across different scales.
+
+    Parameters
+    ----------
+    a              : scale (same units as dx)
+    dx             : pixel spacing; default 1.0
+    support_factor : kernel half-length in units of *a*; default 8
+
+    Returns
+    -------
+    psi : (2 * half_len + 1,) float64 array
+    """
     half_len = int(np.ceil(support_factor * a / dx))
     size = 2 * half_len + 1
     x = np.arange(-half_len, half_len + 1) * dx / a
@@ -270,6 +335,23 @@ def lorentz4_wavelet(a, dx=1.0, support_factor=8):
 
 
 def mexican_hat_wavelet(a, dx=1.0, support_factor=8):
+    """Build a normalised Mexican Hat (Ricker) wavelet kernel at scale *a*.
+
+    The Mexican Hat wavelet is the negative second derivative of a Gaussian:
+        ψ(t) = (1 - t²) · exp(-t²/2),   t = x / a
+
+    The mean is subtracted on the finite support before L2 normalisation.
+
+    Parameters
+    ----------
+    a              : scale (same units as dx)
+    dx             : pixel spacing; default 1.0
+    support_factor : kernel half-length in units of *a*; default 8
+
+    Returns
+    -------
+    psi : (2 * half_len + 1,) float64 array
+    """
     half_len = int(np.ceil(support_factor * a / dx))
     x = np.arange(-half_len, half_len + 1) * dx / max(a, 1e-12)
     psi = (1.0 - x**2) * np.exp(-0.5 * x**2)
@@ -279,6 +361,23 @@ def mexican_hat_wavelet(a, dx=1.0, support_factor=8):
 
 
 def multiscale_lorentz4_transform(x, signal, widths, support_factor=8):
+    """Compute the CWT of *signal* using Lorentz4 wavelets at each scale in *widths*.
+
+    Uses direct convolution (numpy.convolve) — suitable for CPU preprocessing
+    inside RamanDataset.  For GPU-accelerated fitting use
+    tidytorch_utils.lorentz4_multiscale_transform instead.
+
+    Parameters
+    ----------
+    x             : (n_pts,) spectral axis (uniform spacing assumed)
+    signal        : (n_pts,) 1-D signal
+    widths        : iterable of scales in the same units as x
+    support_factor: kernel half-length factor passed to lorentz4_wavelet
+
+    Returns
+    -------
+    W : (len(widths), n_pts) float32 CWT coefficient array
+    """
     dx = x[1] - x[0]
     N = len(signal)
     W = np.zeros((len(widths), N), dtype=np.float32)
@@ -292,6 +391,19 @@ def multiscale_lorentz4_transform(x, signal, widths, support_factor=8):
 
 
 def multiscale_mexhat_transform(x, signal, widths, support_factor=8):
+    """Compute the CWT of *signal* using Mexican Hat wavelets at each scale in *widths*.
+
+    Parameters
+    ----------
+    x             : (n_pts,) spectral axis (uniform spacing assumed)
+    signal        : (n_pts,) 1-D signal
+    widths        : iterable of scales in the same units as x
+    support_factor: kernel half-length factor passed to mexican_hat_wavelet
+
+    Returns
+    -------
+    W : (len(widths), n_pts) float32 CWT coefficient array
+    """
     dx = x[1] - x[0]
     N = len(signal)
     W = np.zeros((len(widths), N), dtype=np.float32)
@@ -366,6 +478,27 @@ def cwt_dispersive_lorentzian(
 
 
 def multiscale_anisotropic_target(x, scales, x0, s0, gamma_x=6.0, sigma_s=0.7, scale_spread=0):
+    """Build a 2-D (scale × position) probability target map for a single peak.
+
+    The target is a Lorentzian blob in the position dimension centred at *x0*,
+    concentrated in scale around the scale index nearest to *s0*, with a
+    Gaussian spread across neighbouring scales controlled by *sigma_s* and
+    *scale_spread*.  The result is normalised to sum to 1.
+
+    Parameters
+    ----------
+    x            : (n_pts,) spectral axis
+    scales       : (n_scales,) wavelet scales
+    x0           : peak centre position (same units as x)
+    s0           : target scale (same units as scales; nearest index is found)
+    gamma_x      : Lorentzian half-width in position (cm⁻¹); default 6.0
+    sigma_s      : Gaussian spread across adjacent scales (in scale-index units); default 0.7
+    scale_spread : number of neighbouring scale indices to include either side; default 0
+
+    Returns
+    -------
+    T : (n_scales, n_pts) float32 normalised probability map
+    """
     X, S = np.meshgrid(x, scales)
     lor_x = 1.0 / (1.0 + ((X - x0) / gamma_x) ** 2)
     s_idx = np.argmin(np.abs(scales - s0))
@@ -383,6 +516,16 @@ from typing import NamedTuple, Optional
 import torch
 
 
+# ---------------------------------------------------------------------------
+# NOTE: RamanSample is defined here for documentation / type-hint purposes.
+# RamanDataset.__getitem__ returns plain Python tuples, NOT RamanSample
+# instances — use SampleWrapper (bottom of this file) for named access at
+# runtime.
+#
+# WARNING: The field ordering in RamanSample does NOT match the runtime tuple.
+# The authoritative field order is SampleWrapper._FIELDS.  In particular,
+# 'gammas' is at index 9 in the runtime tuple but listed at index 5 here.
+# ---------------------------------------------------------------------------
 class RamanSample(NamedTuple):
     # --- Core outputs (original order preserved) ---
     wavelet: torch.Tensor
@@ -390,13 +533,13 @@ class RamanSample(NamedTuple):
     true_xs: torch.Tensor
     centers: torch.Tensor
     amplitudes: torch.Tensor
-    gammas: torch.Tensor
+    gammas: torch.Tensor        # runtime index 9 — see SampleWrapper._FIELDS
     fwhm: torch.Tensor
     separability: torch.Tensor
     sigmas: torch.Tensor
     spectrum: torch.Tensor
 
-    # --- Optional outputs ---
+    # --- Optional outputs (appended after index 9 when enabled) ---
     wavelet_lor: Optional[torch.Tensor] = None
     wavelet_disp: Optional[torch.Tensor] = None
     priors: Optional[torch.Tensor] = None
@@ -449,6 +592,131 @@ class RamanDataset(Dataset):
         seed=42,
         Real=False,
     ):
+        """Construct a synthetic Raman dataset.
+
+        Each call to __getitem__ generates a fresh deterministic sample
+        (reproducible via seed + index) containing:
+          - wavelet transform of the spectrum  (shape: n_scales × n_pts)
+          - 2-D probability target map         (same shape)
+          - ground-truth peak parameters       (centers, amplitudes, fwhm, sigmas, gammas)
+          - the raw spectrum
+
+        Optionally appends wavelet companion channels, prior maps, and
+        neural-network pipeline predictions (see optional flags below).
+
+        Parameters
+        ----------
+        x : array-like
+            Spectral axis (e.g. wavenumber in cm⁻¹), shape (n_pts,).
+        widths : array-like
+            Wavelet scale priors — also used as the set of scales for the CWT.
+            If ``max_sigma`` is set, scales above that value are removed.
+        n_samples : int
+            Number of samples the dataset reports.  Samples are generated on
+            the fly and are fully deterministic given ``seed``.
+        n_peaks : int or (int, int)
+            Fixed peak count, or (min, max) range sampled uniformly per sample.
+        amp_range : (float, float)
+            Amplitude sampling range.  Sampled linearly unless ``LogAmp=True``.
+        fwhm_range : (float, float)
+            FWHM sampling range in the same units as *x*.
+        separability_range : (float, float)
+            Range for the separability parameter S, which controls the minimum
+            allowed adjacent-peak spacing relative to their widths.
+            S = 1 → peaks just touch; S > 1 → peaks are more separated.
+        gamma : float or (float, float)
+            Lorentzian half-width of peaks.  If a tuple, sampled uniformly
+            per peak from that range; if a scalar, used as a constant.
+        noise_std : float
+            Standard deviation of additive Gaussian noise; 0.0 → noiseless.
+        margin : float
+            Minimum distance from the spectral axis edges for peak centres.
+        beta_amp : float
+            Amplitude-ratio correction to required separability.  Higher values
+            enforce more spacing between peaks of very different amplitudes.
+        sep_extra : float
+            Additive extra spacing (same units as x) on top of the computed
+            minimum separation.
+        min_peaks_after_trunc : int
+            Minimum number of peaks that must remain after boundary truncation.
+        max_sigma : float or None
+            If set, remove wavelet scales larger than this value from *widths*.
+        LogAmp : bool
+            If True, sample amplitudes log-uniformly (good for wide dynamic ranges).
+        wavelet_repr : {"linear", "log", "abs"}
+            Transform applied to the raw CWT coefficients before returning.
+            ``"log"`` → log(|W| + log_eps);  ``"abs"`` → |W|.
+        log_eps : float
+            Small constant added before log when ``wavelet_repr="log"``.
+        target_gamma_x : float
+            Lorentzian half-width of the 2-D target blob in the position axis.
+        target_sigma_s : float
+            Gaussian spread of the 2-D target blob in the scale axis.
+        target_scale_spread : int
+            Number of neighbouring scale indices to populate in the target.
+        wavelet : {"Lor4", "MexHat", "DispLor"}
+            Primary wavelet family for the CWT returned as the first output.
+        MexHat : bool or None
+            Legacy flag; if set, overrides ``wavelet`` (True → "MexHat",
+            False → "Lor4").  Prefer ``wavelet=`` instead.
+        disp_lor_support_factor : float
+            ``support_factor`` passed to dispersive Lorentzian wavelet builder.
+        disp_lor_pad_mode : str
+            Padding mode for CWT boundary handling (numpy.pad mode string).
+        disp_lor_mask_coi : bool
+            If True, zero out cone-of-influence boundary regions of the
+            dispersive Lorentzian CWT.
+        return_both_wavelets : bool
+            If True, append the Lor4 and DispLor CWT arrays as extra outputs
+            (indices 9 and 10, or 10 and 11 if priors are also returned).
+            Automatically set to True when ``return_pipeline_estimates=True``.
+        return_priors : bool
+            If True, append a (2, n_scales, n_pts) prior map tensor built from
+            ridge and signed-pair detections on the dispersive CWT.
+            Requires ``mswt_peak_priors`` (not in this repository).
+        ridge_prior_cfg, signedpair_prior_cfg
+            Configuration objects for the prior-map algorithms; defaults are
+            used if None.
+        prior_line_sigma_px : float
+            Gaussian blur (in pixels) applied when rasterising detected peak
+            positions onto the prior maps.
+        return_pipeline_estimates : bool
+            If True, run a pre-trained UNet pipeline estimator on each sample
+            and append its predicted peak positions, amplitudes, and FWHM.
+            Requires ``pipeline_checkpoint_path`` and the optional modules
+            ``model_defs``, ``post_UNet_utils``, ``utils_wavelet_geometry``.
+        pipeline_checkpoint_path : str or None
+            Path to the model checkpoint (.pt file) for the pipeline estimator.
+        pipeline_device : str or None
+            Device string (e.g. ``"cuda"``, ``"cpu"``) for pipeline inference;
+            auto-detected (MPS → CUDA → CPU) if None.
+        pipeline_prob_mode : {"softmax", "sigmoid_norm"}
+            How to convert raw logits to a probability map.
+        pipeline_max_peaks : int
+            Maximum number of peaks the pipeline estimator may return.
+        pipeline_min_distance : int
+            Minimum pixel distance between pipeline-detected peaks.
+        pipeline_min_prominence_rel : float
+            Minimum probability relative to the map maximum for a peak to be
+            retained.
+        pipeline_edge_exclude : int
+            Number of edge pixels to zero out in the probability map before
+            peak extraction.
+        pipeline_post_cfg
+            ``ScaleAmpConfig`` object (or dict) for amplitude/scale estimation
+            post-processing.  Default ``ScaleAmpConfig()`` is used if None.
+        pipeline_use_nondispersive_y : bool
+            If True, pass the non-dispersive (absorptive) spectrum to the
+            pipeline's amplitude estimator.
+        rng : ignored
+            Kept for API compatibility; per-sample RNGs are derived from
+            ``seed + index`` so no persistent RNG is stored.
+        seed : int
+            Base random seed.  Sample ``i`` uses ``seed + i`` as its seed.
+        Real : bool
+            If True, generate dispersive (imaginary Voigt) spectra and sample
+            amplitudes linearly regardless of ``LogAmp``.
+        """
         self.x = np.asarray(x, dtype=np.float32)
 
         widths = np.asarray(widths, dtype=np.float32)
@@ -1055,6 +1323,20 @@ def dataset_from_curriculum_stage(
 
 
 def raman_collate_fn(batch):
+    """Collate a list of RamanDataset samples into a batch.
+
+    Peak counts vary per sample, so the variable-length fields (true_xs,
+    centers, amplitudes) are zero-padded to the maximum peak count in the
+    batch.  true_xs uses -1 as the pad value.
+
+    Use this as the ``collate_fn`` argument to ``torch.utils.data.DataLoader``
+    when working with RamanDataset.
+
+    Returns
+    -------
+    tuple of batched tensors in the same order as SampleWrapper._FIELDS,
+    omitting optional tails that are absent from the batch samples.
+    """
     W_list, target_list, true_xs_list, centers_list, amps_list = zip(
         *[sample[:5] for sample in batch]
     )
