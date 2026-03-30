@@ -3,6 +3,7 @@
 **CWT-Adam Spectral Curve-fitting And Decomposition Engine**
 
 CASCADE is a Python/PyTorch library for decomposing Raman (and BCARS) spectra into pseudo-Voigt peak components. It uses continuous wavelet transforms (CWT) for robust peak detection and GPU-accelerated Adam optimisation for fitting.
+<img width="748" height="526" alt="TOCFig_Peak_Fitting (1)" src="https://github.com/user-attachments/assets/a4e9904a-ce5e-4049-9106-56e25fb10451" />
 
 ---
 
