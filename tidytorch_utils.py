@@ -76,27 +76,22 @@ def compute_wavelet_peak(sigma, gamma, x: torch.Tensor) -> torch.Tensor:
     return profile / (profile.max() + 1e-12)
 
 
-# def precompute_wavelets(
-#     sigmas: torch.Tensor,
-#     gammas: torch.Tensor,
-#     x: torch.Tensor,
-# ) -> torch.Tensor:
-#     """
-#     Build wavelet bank for every (sigma, gamma) pair.
-#     Returns shape (n_sigmas, n_gammas, n_pts).
-
-#     Replaces the double jax.vmap(compute_wavelet_peak) call in the original.
-#     """
-#     n_s   = len(sigmas)
-#     n_g   = len(gammas)
-#     n_pts = len(x)
-#     out   = torch.empty(n_s, n_g, n_pts, device=x.device)
-#     for i, s in enumerate(sigmas):
-#         for j, g in enumerate(gammas):
-#             out[i, j] = compute_wavelet_peak(s, g, x)
-#     return out
-
 def precompute_wavelets(sigmas, gammas, x):
+    """Build a pseudo-Voigt wavelet bank for every (sigma, gamma) pair.
+
+    Uses broadcasting to compute all (n_sigmas × n_gammas) wavelets in a
+    single vectorised call — replaces the double jax.vmap in the original.
+
+    Parameters
+    ----------
+    sigmas : (n_sigmas,) tensor — Gaussian half-widths
+    gammas : (n_gammas,) tensor — Lorentzian half-widths
+    x      : (n_pts,)   tensor — spectral axis
+
+    Returns
+    -------
+    bank : (n_sigmas, n_gammas, n_pts) float32 tensor, unit-height wavelets
+    """
     x_c = x - x.mean()
     # (n_s, 1, 1) and (1, n_g, 1) broadcast against (1, 1, n_pts)
     s = sigmas.reshape(-1, 1, 1)
@@ -466,35 +461,9 @@ def residual_projected(p, x, y):
     return torch.sum((model - y) ** 2)
 
 
-# def project_bounds(p, x, fwhm_exp=None, fwhm_max_scale=None, hyperparams=None):
-#     """
-#     Project parameters to valid bounds.
-
-#     Constraints:
-#     - Amplitude : [0,    1.0]
-#     - Center    : [0, 2304.0]
-#     - Sigma     : [0.05,  50.0]
-#     - Gamma     : [0.05,  50.0]
-#     """
-#     p_r = p.reshape(-1, 4)
-#     amp = torch.clamp(p_r[:, 0], 0.0,    1.0)
-#     ctr = torch.clamp(p_r[:, 1], 0.0, 4000.0)
-#     sig = torch.clamp(p_r[:, 2], 0.05,  50.0)
-#     gam = torch.clamp(p_r[:, 3], 0.05,  50.0)
-
-#     result = torch.stack([amp, ctr, sig, gam], dim=1).reshape(-1)
-#     result = torch.where(torch.isfinite(result), result, p.reshape(-1))
-#     return result
-
-# def project_bounds(p, x, fwhm_exp=None, fwhm_max_scale=None, hyperparams=None):
-#     p_r = p.reshape(-1, 4)
-#     lo = torch.tensor([0.0, 0.0, 0.05, 0.05], device=p.device)
-#     hi = torch.tensor([1.0, 4000.0, 50.0, 50.0], device=p.device)
-#     result = torch.clamp(p_r, lo, hi)
-#     result = torch.where(torch.isfinite(result), result, p_r)
-#     return result.reshape(-1)
-
-# Create these ONCE at module level or at the start of fit_with_bounded_adam:
+# _LO / _HI are initialised on first use inside project_bounds and
+# re-created whenever the tensor device changes.  init_sweep_context also
+# sets them explicitly for the batch fitting path.
 _LO = None
 _HI = None
 @torch.compile(fullgraph=True)
@@ -513,96 +482,33 @@ def _compiled_forward(params, x_t, y_t):
     model = compute_model(params, x_t)
     return torch.sum((model - y_t) ** 2)
 
-# def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
-#     """
-#     Adam optimizer with projection at each step.
-#     - torch.autograd replaces jax.value_and_grad
-#     - Python for-loop replaces jax.lax.scan
-#     - torch.optim.Adam replaces optax
-#     """
-#     x_t = x.clone().detach().float() if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=device)
-#     y_t = y.clone().detach().float() if isinstance(y, torch.Tensor) else torch.tensor(y, dtype=torch.float32, device=device)
-#     params = p0_stack.clone().detach().float() if isinstance(p0_stack, torch.Tensor) else torch.tensor(p0_stack, dtype=torch.float32, device=device)
-    
-#     # x_t = torch.as_tensor(np.asarray(x), dtype=torch.float32)
-#     # y_t = torch.as_tensor(np.asarray(y), dtype=torch.float32)
-
-#     # params = torch.tensor(np.asarray(p0_stack), dtype=torch.float32)
-#     params = project_bounds(params, x_t)
-#     params = params.requires_grad_(True)
-
-#     # Warmup + cosine decay — mirrors the original optax schedule
-#     peak_lr = 1e-2
-#     end_lr  = 1e-5
-#     warmup  = 100
-
-#     optimizer = torch.optim.Adam([params], lr=peak_lr, betas=(0.9, 0.999))
-
-#     def lr_lambda(step):
-#         if step < warmup:
-#             return step / warmup
-#         progress = (step - warmup) / max(1, max_iter - warmup)
-#         cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
-#         return end_lr / peak_lr + (1.0 - end_lr / peak_lr) * cosine
-
-#     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-#     # losses = []
-#     # for _ in range(max_iter):
-#     #     optimizer.zero_grad()
-#     #     loss = residual_projected(params, x_t, y_t)
-#     #     loss.backward()
-#     #     torch.nn.utils.clip_grad_norm_([params], 1.0)
-#     #     optimizer.step()
-#     #     scheduler.step()
-
-#     #     with torch.no_grad():
-#     #         params.data = project_bounds(params.data, x_t)
-
-#     #     losses.append(loss.item())
-#     #     if losses[-1] < tol:
-#     #         break
-#     last_loss = float('inf')
-#     n_iter = 0
-#     # for i in range(max_iter):
-#     #     optimizer.zero_grad()
-#     #     loss = residual_projected(params, x_t, y_t)
-#     #     loss.backward()
-#     #     torch.nn.utils.clip_grad_norm_([params], 1.0)
-#     #     optimizer.step()
-#     #     scheduler.step()
-
-#     #     with torch.no_grad():
-#     #         params.data = project_bounds(params.data, x_t)
-
-#     #     n_iter += 1
-#     #     if i % 50 == 0:
-#     #         last_loss = loss.item()
-#     #         if last_loss < tol:
-#     #             break
-#     for i in range(max_iter):
-#         optimizer.zero_grad()
-#         loss = _compiled_forward(params, x_t, y_t)  # <-- use compiled version
-#         loss.backward()
-#         torch.nn.utils.clip_grad_norm_([params], 1.0)
-#         optimizer.step()
-#         scheduler.step()
-
-#         with torch.no_grad():
-#             params.data = project_bounds(params.data, x_t)
-
-#         n_iter += 1
-#         if i % 50 == 0:
-#             last_loss = loss.item()
-#             if last_loss < tol:
-#                 break
-
-#     final_params = params.detach()
-#     converged = last_loss < tol
-#     return final_params, last_loss, converged, n_iter
-
-
 def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
+    """Fit a single spectrum using Adam with warmup/cosine LR and bounds projection.
+
+    LR schedule:
+      - Steps 0 → warmup (100):   linear ramp from 0 → peak_lr (1e-2)
+      - Steps warmup → max_iter:  cosine decay from peak_lr → end_lr (1e-5)
+
+    After each gradient step, parameters are clamped to valid bounds:
+      amplitude ∈ [0, 1],  centre ∈ [0, 4000],  sigma/gamma ∈ [0.05, 50]
+
+    Convergence is checked every 50 steps; early exit when loss < tol.
+
+    Parameters
+    ----------
+    y         : (n_pts,) target spectrum
+    x         : (n_pts,) wavenumber axis
+    p0_stack  : (max_peaks * 4,) flat initial parameter vector [amp,ctr,sig,gam, ...]
+    max_iter  : maximum optimisation steps
+    tol       : loss value below which optimisation is considered converged
+
+    Returns
+    -------
+    final_params : (max_peaks * 4,) optimised parameters (detached)
+    last_loss    : float, final loss value
+    converged    : bool
+    n_iter       : int, number of steps taken
+    """
     if isinstance(p0_stack, torch.Tensor):
         dev = p0_stack.device
     elif isinstance(y, torch.Tensor):
@@ -623,7 +529,7 @@ def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
     end_lr  = 1e-5
     warmup  = 100
 
-    # optimizer = torch.optim.Adam([params], lr=peak_lr, betas=(0.9, 0.999))
+    # fused=True uses a single CUDA kernel for the Adam update — faster on GPU
     optimizer = torch.optim.Adam([params], lr=peak_lr, betas=(0.9, 0.999), fused=True)
     
     last_loss = float('inf')
@@ -671,46 +577,39 @@ def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
 # ---------------------------------------------------------------------------
 
 def prune_peaks(params: torch.Tensor, amp_threshold: float = 1e-3) -> torch.Tensor:
-    """Zero out peaks whose amplitude is below threshold."""
+    """Zero out peaks whose amplitude is below threshold.
+
+    Parameters
+    ----------
+    params        : (max_peaks * 4,) flat parameter vector
+    amp_threshold : peaks with |amplitude| ≤ this value are zeroed
+
+    Returns
+    -------
+    (max_peaks * 4,) with sub-threshold peaks replaced by zeros
+    """
     peaks     = params.reshape(-1, 4)
     keep_mask = peaks[:, 0].abs() > amp_threshold
     return (peaks * keep_mask.unsqueeze(1)).reshape(-1)
 
 
-# def deduplicate_peaks(params: torch.Tensor, min_spacing: float) -> torch.Tensor:
-#     """
-#     Zero out fitted peaks whose center is within ``min_spacing`` of a
-#     higher-amplitude peak.  Greedy: peaks are considered in descending
-#     amplitude order; when two peaks are too close, the weaker one is removed.
-#     """
-#     if min_spacing <= 0.0:
-#         return params
-
-#     peaks = params.reshape(-1, 4).clone()
-#     amp_order = torch.argsort(-peaks[:, 0])   # descending amplitude
-
-#     suppress = torch.zeros(len(peaks), dtype=torch.bool, device=params.device)
-#     for ii in range(len(peaks)):
-#         i = amp_order[ii].item()
-#         if suppress[i]:
-#             continue
-#         if peaks[i, 0].item() <= 0:
-#             break                              # remaining are zero-amplitude
-#         ctr_i = peaks[i, 1].item()
-#         for jj in range(ii + 1, len(peaks)):
-#             j = amp_order[jj].item()
-#             if suppress[j]:
-#                 continue
-#             if peaks[j, 0].item() <= 0:
-#                 break
-#             if abs(peaks[j, 1].item() - ctr_i) < min_spacing:
-#                 suppress[j] = True             # j is weaker and too close to i
-
-#     peaks[suppress] = 0.0
-#     return peaks.reshape(-1)
-
-
 def deduplicate_peaks(params: torch.Tensor, min_spacing: float) -> torch.Tensor:
+    """Remove peaks that are too close to a stronger neighbour.
+
+    Peaks are sorted by descending amplitude.  A peak is suppressed if any
+    higher-amplitude peak lies within *min_spacing* wavenumber units of its
+    centre.  Uses a vectorised pairwise distance matrix instead of a Python
+    loop — O(N²) memory but fast in practice for typical peak counts.
+
+    Parameters
+    ----------
+    params      : (max_peaks * 4,) flat parameter vector [amp, ctr, sig, gam, ...]
+    min_spacing : minimum allowed centre separation; 0.0 disables the check
+
+    Returns
+    -------
+    (max_peaks * 4,) with suppressed peaks zeroed out
+    """
     if min_spacing <= 0.0:
         return params
 
@@ -1162,20 +1061,26 @@ def plot_voigt_fit_res_two(
 
 
 
-# ── Sweep context — call init_sweep_context() once before using sweep fns ────
+# ── Sweep context ─────────────────────────────────────────────────────────────
+# Call init_sweep_context() once before using _fit_one, _run_sweep, or
+# _plot_sweep (via plot_utils).  These module-level globals are populated by
+# that call and are read by the batch GPU kernels (_denoise_batch,
+# _lor4_transform_batch, _fit_batch_adam) as well as the peak-detection and
+# matching helpers.  They are intentionally global so that multiple calls to
+# _fit_one / _run_sweep within a session share the same pre-computed tensors.
 
 _ctx_x      = None   # (n_pts,) numpy float32 wavenumber axis
-_ctx_sigmas = None   # (n_widths,) tensor
-_ctx_gammas = None   # (n_gammas,) tensor
+_ctx_sigmas = None   # (n_widths,) tensor — wavelet width parameters
+_ctx_gammas = None   # (n_gammas,) tensor — Lorentzian gamma parameters
 _ctx_widths = None   # width priors passed to RamanDataset
-_ctx_device = None   # torch.device
-_x_dev      = None   # _ctx_x on device
-_lor4_bank  = None   # (n_widths, n_pts) wavelet bank on device
-_lor4_fft   = None   # (n_widths, n_pts) FFT(_lor4_bank) cached on device
-_lor4_energy = None  # (n_widths, 1) per-wavelet energy cached on device
-_ker_fft    = None   # (n_pts,) FFT of denoise kernel on device
-_LO         = None   # (4,) lower param bounds
-_HI         = None   # (4,) upper param bounds
+_ctx_device = None   # torch.device used by all batch kernels
+_x_dev      = None   # _ctx_x moved to device
+_lor4_bank  = None   # (n_widths, n_pts) Lorentz4 wavelet bank on device
+_lor4_fft   = None   # (n_widths, n_pts) FFT of _lor4_bank (cached to avoid recompute)
+_lor4_energy = None  # (n_widths, 1) per-wavelet L2 energy for FFT normalisation
+_ker_fft    = None   # (n_pts,) FFT of the denoise convolution kernel
+_LO         = None   # (4,) lower parameter bounds [amp, ctr, sig, gam]
+_HI         = None   # (4,) upper parameter bounds
 
 
 def init_sweep_context(x, sigmas, gammas, device, widths,
@@ -1789,6 +1694,36 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
              min_scale_votes=6, max_peaks=200,
              aggressive_start_steps=60, aggressive_lr_mult=3.0,
              aggressive_clip_norm=3.0, aggressive_beta1=0.85):
+    """Fit one SampleWrapper spectrum using the cached sweep context.
+
+    Requires init_sweep_context() to have been called beforehand.
+
+    Runs the full pipeline on a single spectrum:
+      denoise → Lor4 CWT → cross-scale vote → initial guesses → batched Adam
+
+    Parameters
+    ----------
+    sample_wrapper        : SampleWrapper from RamanDataset
+    max_iter              : Adam iteration budget
+    tol                   : convergence tolerance
+    amp_threshold         : minimum fitted amplitude to retain a peak
+    ctr_tol               : centre tolerance for GT/fitted peak matching (cm⁻¹)
+    min_spacing           : minimum allowed spacing between initial-guess peaks
+    response_threshold    : minimum CWT response to retain a candidate position
+    min_scale_votes       : minimum number of wavelet scales that must vote for
+                            a position before it is considered a peak candidate
+    max_peaks             : maximum number of peaks to initialise
+    aggressive_start_steps: number of steps to use the boosted LR at the start
+    aggressive_lr_mult    : LR multiplier during the aggressive phase
+    aggressive_clip_norm  : gradient clip norm during the aggressive phase
+    aggressive_beta1      : Adam β₁ during the aggressive phase
+
+    Returns
+    -------
+    stats    : dict from _match_peaks (precision, recall, f1, errors, ...)
+    params   : (max_peaks * 4,) numpy float32 fitted parameters
+    spec_d   : (n_pts,) numpy float32 denoised spectrum
+    """
     s      = sample_wrapper
     spec_t = torch.as_tensor(_cpu(s.spectrum), dtype=torch.float32).to(_ctx_device)
     spec_d = _denoise_batch(spec_t.unsqueeze(0)).squeeze(0)

@@ -1,3 +1,40 @@
+"""
+plot_utils.py
+=============
+Visualisation utilities for CASCADE spectral fits.
+
+Functions
+---------
+init_plot_context               Cache x and widths; must be called before _plot_sweep.
+plot_voigt_fit_res              Single-spectrum decomposition plot with residual panel.
+plot_voigt_fit_compare_detailed GT vs. recovered comparison with peak matching.
+plot_shape_rmse                 Per-pair shape-RMSE spectrum overview and bar chart.
+_plot_sweep                     Journal-ready 3×2 parameter-sweep figure.
+
+Helper classes / functions (internal)
+--------------------------------------
+HandlerRainbowLine  Custom legend handler that draws a gradient-coloured line.
+_thin_ticks         Reduce tick density to at most max_ticks labels.
+_style_ax           Apply consistent axis styling.
+_add_violin         Single violin + jitter scatter.
+_dual_violin        Two interleaved violin sets on shared axes.
+_dual_y_violin      Two violin sets on separate y-axes (twin axes).
+
+Usage
+-----
+Call init_sweep_context (tidytorch_utils) and init_plot_context (this module)
+once before using _plot_sweep:
+
+    from tidytorch_utils import init_sweep_context
+    from plot_utils import init_plot_context, _plot_sweep
+
+    init_sweep_context(x, sigmas, gammas, device, widths)
+    init_plot_context(x, widths)
+
+    results = _run_sweep("noise_std", [0.0, 0.01, 0.05])
+    _plot_sweep("noise_std", [0.0, 0.01, 0.05], results)
+"""
+
 # Core
 import importlib
 import numpy as np
@@ -28,6 +65,15 @@ def init_plot_context(x, widths):
 
 
 class HandlerRainbowLine(HandlerBase):
+    """Matplotlib legend handler that renders a legend entry as a rainbow gradient line.
+
+    Pass an instance of this class in the ``handler_map`` argument of
+    ``ax.legend()`` to render a proxy handle with a colour gradient:
+
+        proxy = mlines.Line2D([], [], label="Component peaks")
+        ax.legend(handles=[proxy],
+                  handler_map={proxy: HandlerRainbowLine()})
+    """
     def __init__(self, cmap="rainbow", n_segments=20, **kwargs):
         super().__init__(**kwargs)
         self.cmap = plt.get_cmap(cmap)
@@ -54,6 +100,23 @@ class HandlerRainbowLine(HandlerBase):
 
         
 def plot_voigt_fit_res(x, y_true, params, peaks_dict=None, title='Voigt Fit Breakdown'):
+    """Plot a Voigt peak decomposition with a residual panel.
+
+    Draws:
+      - Upper panel: raw spectrum, model sum (dashed red), and individual
+        component peaks (rainbow-coloured via HandlerRainbowLine).
+      - Lower panel: residual = y_true - model_sum, filled grey.
+
+    Also prints RMSE and R² to stdout.
+
+    Parameters
+    ----------
+    x         : (n_pts,) wavenumber axis
+    y_true    : (n_pts,) measured spectrum
+    params    : (n_peaks * 4,) flat parameter vector [amp, ctr, sig, gam, ...]
+    peaks_dict: unused; kept for API compatibility
+    title     : figure title string
+    """
     plt.rcParams.update({
         "font.family": "serif",
         "font.size": 11,
@@ -275,7 +338,6 @@ def plot_voigt_fit_compare_detailed(x, y_true, gt_params, rec_params, title='Voi
              label=f'Rec Sum ({n_valid_rec} peaks)', alpha=0.7, zorder=8)
     
     # Plot matched peaks (green)
-    # Plot matched peaks (green)
     gt_label_added = False
     rec_label_added = False
 
@@ -322,115 +384,7 @@ def plot_voigt_fit_compare_detailed(x, y_true, gt_params, rec_params, title='Voi
     ax2.set_ylabel("Residual", fontsize=10)
     ax2.legend(fontsize=9)
     ax2.grid(True, alpha=0.3)
-    
-    # # Peak matching statistics table
-    # ax3.axis('off')
-    
-    # if n_matched > 0:
-    #     # Create table for matched peaks
-    #     table_data = [['GT Idx', 'Rec Idx', 'Center (GT)', 'Center (Rec)', 'Δ Center', 
-    #                   'Amp (GT)', 'Amp (Rec)', 'Δ Amp %']]
-        
-    #     for err in peak_errors[:10]:  # Show first 10
-    #         table_data.append([
-    #             f"{err['gt_idx']}",
-    #             f"{err['rec_idx']}",
-    #             f"{valid_peaks_gt[err['gt_idx']][1]:.1f}",
-    #             f"{valid_peaks_rec[err['rec_idx']][1]:.1f}",
-    #             f"{err['ctr_error']:.2f}",
-    #             f"{valid_peaks_gt[err['gt_idx']][0]:.3f}",
-    #             f"{valid_peaks_rec[err['rec_idx']][0]:.3f}",
-    #             f"{err['amp_rel_error']:.1f}%"
-    #         ])
-        
-    #     table = ax3.table(cellText=table_data, cellLoc='center', loc='center',
-    #                      colWidths=[0.08, 0.08, 0.12, 0.12, 0.10, 0.12, 0.12, 0.10])
-    #     table.auto_set_font_size(False)
-    #     table.set_fontsize(8)
-    #     table.scale(1, 1.5)
-        
-    #     # Color header
-    #     for i in range(len(table_data[0])):
-    #         table[(0, i)].set_facecolor('#40466e')
-    #         table[(0, i)].set_text_props(weight='bold', color='white')
-        
-    #     ax3.set_title("Matched Peak Comparison (First 10)", fontsize=11, pad=10)
-    # else:
-    #     ax3.text(0.5, 0.5, 'No matched peaks found!', 
-    #             ha='center', va='center', fontsize=12, color='red')
-    
-    # # Peak-to-peak error summary
-    # ax4.axis('off')
-    
-    # if n_matched > 0:
-    #     avg_amp_error = np.mean([e['amp_rel_error'] for e in peak_errors])
-    #     avg_ctr_error = np.mean([e['ctr_error'] for e in peak_errors])
-    #     avg_sig_error = np.mean([e['sig_error'] for e in peak_errors])
-        
-    #     max_amp_error = np.max([e['amp_rel_error'] for e in peak_errors])
-    #     max_ctr_error = np.max([e['ctr_error'] for e in peak_errors])
-        
-    #     summary_text = f"""
 
-        
-    #             Peak Matching Summary:
-    #     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #     Total GT Peaks:        {n_valid_gt}
-    #     Total Rec Peaks:       {n_valid_rec}
-    #     Matched Pairs:         {n_matched}
-    #     Missing Peaks:         {n_missing}  {'← Problem!' if n_missing > 0 else ''}
-    #     Extra Peaks:           {n_extra}    {'← Overfit?' if n_extra > 0 else ''}
-
-    #     Matched Peak Errors (Mean):
-    #     Amplitude Error:     {avg_amp_error:.2f}%
-    #     Center Error:        {avg_ctr_error:.3f}
-    #     Sigma Error:         {avg_sig_error:.3f}
-
-    #     Matched Peak Errors (Max):
-    #     Amplitude Error:     {max_amp_error:.2f}%
-    #     Center Error:        {max_ctr_error:.3f}
-    #             """
-        
-    #     ax4.text(0.1, 0.5, summary_text, fontsize=10, family='monospace',
-    #             va='center', ha='left')
-    # else:
-    #     ax4.text(0.5, 0.5, 'No matched peaks to analyze!',
-    #             ha='center', va='center', fontsize=12, color='red')
-    
-    # plt.tight_layout()
-    
-    # # Print detailed statistics
-    # print(f"\n{'='*60}")
-    # print(f"PEAK MATCHING ANALYSIS")
-    # print(f"{'='*60}")
-    # print(f"\nOverall Statistics:")
-    # print(f"  RMSE: {rmse:.6f}")
-    # print(f"  R²: {r2:.4f}")
-    # print(f"  Ground Truth Peaks: {n_valid_gt}")
-    # print(f"  Reconstructed Peaks: {n_valid_rec}")
-    # print(f"  Matched: {n_matched}")
-    # print(f"  Missing: {n_missing}")
-    # print(f"  Extra: {n_extra}")
-    
-    # if n_missing > 0:
-    #     print(f"\n⚠️  MISSING PEAKS (in GT, not reconstructed):")
-    #     for gt_idx in unmatched_gt:
-    #         gt_peak = valid_peaks_gt[gt_idx]
-    #         print(f"    Peak at center={gt_peak[1]:.1f}, amp={gt_peak[0]:.4f}")
-    
-    # if n_extra > 0:
-    #     print(f"\n⚠️  EXTRA PEAKS (reconstructed, not in GT):")
-    #     for rec_idx in unmatched_rec:
-    #         rec_peak = valid_peaks_rec[rec_idx]
-    #         print(f"    Peak at center={rec_peak[1]:.1f}, amp={rec_peak[0]:.4f}")
-    
-    # if n_matched > 0:
-    #     print(f"\n✓ MATCHED PEAK ERRORS:")
-    #     print(f"    Mean Amplitude Error: {avg_amp_error:.2f}%")
-    #     print(f"    Mean Center Error: {avg_ctr_error:.3f}")
-    #     print(f"    Max Amplitude Error: {max_amp_error:.2f}%")
-    #     print(f"    Max Center Error: {max_ctr_error:.3f}")
-    
     return fig, (ax1, ax2), {
         'matched': matched_pairs,
         'missing_gt': unmatched_gt,
@@ -441,14 +395,14 @@ def plot_voigt_fit_compare_detailed(x, y_true, gt_params, rec_params, title='Voi
     }
 
 
-"""
-Sweep plot v6 - journal-ready, symmetric 2x3 layout.
-
-Layout:
-  Row 0:  Precision+Recall (shared axes)     |  F1
-  Row 1:  Amp + Center error (dual y-axis)   |  Shape RMSE
-  Row 2:  Example spectrum (low noise)       |  Example spectrum (high noise)
-"""
+# ---------------------------------------------------------------------------
+# Sweep plot — journal-ready, symmetric 3×2 layout
+#
+# Layout:
+#   Row 0:  Precision+Recall (shared axes)     |  F1
+#   Row 1:  Amp + Center error (dual y-axis)   |  Shape RMSE
+#   Row 2:  Example spectrum (low noise)       |  Example spectrum (high noise)
+# ---------------------------------------------------------------------------
 
 import numpy as np
 import matplotlib as mpl
@@ -693,13 +647,40 @@ def _dual_y_violin(ax, data_left, data_right, labels,
     return ax2
 
 
-# == Main ======================================================================
-
 def _plot_sweep(param_name, param_values, all_results,
                 noise_fixed=0.01, sep_fixed=(1.0, 1.5),
                 example_idx=(0, -1), example_seed=123,
                 max_iter=2000, tol=1e-5, amp_thr=1e-2,
                 save_path=None):
+    """Generate a journal-ready 3×2 figure summarising a parameter sweep.
+
+    Requires both init_sweep_context() (tidytorch_utils) and
+    init_plot_context() (this module) to have been called beforehand.
+
+    Layout
+    ------
+    Row 0: Precision & Recall (dual violin)  |  F1 score (single violin)
+    Row 1: Amp + Centre error (dual y-axis)  |  Shape RMSE (single violin)
+    Row 2: Example spectrum at param_values[example_idx[0]]  |  … [example_idx[1]]
+
+    Parameters
+    ----------
+    param_name    : "noise_std" or "separability" (used for x-axis labelling
+                    and dataset construction inside example panels)
+    param_values  : list of parameter values that were swept; must match the
+                    keys used in all_results
+    all_results   : dict mapping each param value (or str(value)) to a list of
+                    metric dicts as returned by _match_peaks / _run_sweep
+    noise_fixed   : noise_std held constant when sweeping separability
+    sep_fixed     : separability_range held constant when sweeping noise
+    example_idx   : indices into param_values for the two example spectrum panels;
+                    negative indices count from the end
+    example_seed  : RNG seed for the example RamanDataset samples
+    max_iter      : Adam iteration budget for example-panel fitting
+    tol           : convergence tolerance for example-panel fitting
+    amp_thr       : minimum fitted amplitude to show a peak in example panels
+    save_path     : if not None, save the figure to this path before showing
+    """
 
     with mpl.rc_context(_JOURNAL_RC):
 
@@ -973,36 +954,6 @@ def plot_shape_rmse(x, y_true, gt_params, rec_params,
     ax_bar.set_title("Shape RMSE per matched pair"); ax_bar.legend(fontsize=9)
     ax_bar.grid(True, alpha=0.25, axis='y')
     plt.colorbar(sm, ax=ax_bar, label='Shape RMSE')
-
-    # # (C) Histogram ───────────────────────────────────────────────────────────
-    # ax_hist = fig.add_subplot(gs[1, 1])
-    # ax_hist.hist(rmses, bins=max(10, n_matched // 3),
-    #              color='steelblue', edgecolor='white', alpha=0.8)
-    # ax_hist.axvline(np.median(rmses), color='steelblue', lw=2, linestyle='--',
-    #                 label=f'Median {np.median(rmses):.3f}')
-    # ax_hist.axvline(np.mean(rmses),   color='crimson',   lw=2, linestyle=':',
-    #                 label=f'Mean   {np.mean(rmses):.3f}')
-    # ax_hist.set_xlabel("Shape RMSE"); ax_hist.set_ylabel("Count")
-    # ax_hist.set_title("Distribution of shape RMSE"); ax_hist.legend(fontsize=9)
-    # ax_hist.grid(True, alpha=0.25)
-
-    # # (D) RMSE vs GT amplitude ────────────────────────────────────────────────
-    # ax_amp = fig.add_subplot(gs[2, 0])
-    # sc = ax_amp.scatter(amps_gt, rmses, c=rmses, cmap=cmap, norm=norm,
-    #                     s=45, edgecolors='k', linewidths=0.4, zorder=5)
-    # ax_amp.set_xlabel("GT amplitude"); ax_amp.set_ylabel("Shape RMSE")
-    # ax_amp.set_title("Shape RMSE vs GT amplitude")
-    # ax_amp.grid(True, alpha=0.25)
-    # plt.colorbar(sc, ax=ax_amp, label='Shape RMSE')
-
-    # # (E) RMSE vs centre ──────────────────────────────────────────────────────
-    # ax_ctr = fig.add_subplot(gs[2, 1])
-    # sc2 = ax_ctr.scatter(centers, rmses, c=rmses, cmap=cmap, norm=norm,
-    #                      s=45, edgecolors='k', linewidths=0.4, zorder=5)
-    # ax_ctr.set_xlabel("GT centre (cm⁻¹)"); ax_ctr.set_ylabel("Shape RMSE")
-    # ax_ctr.set_title("Shape RMSE vs peak centre")
-    # ax_ctr.grid(True, alpha=0.25)
-    # plt.colorbar(sc2, ax=ax_ctr, label='Shape RMSE')
 
     plt.suptitle(
         f"Peak Shape RMSE  |  {n_matched} matched pairs  |  "
