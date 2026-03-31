@@ -536,7 +536,7 @@ def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
     y_t = y.clone().detach().float().to(dev) if isinstance(y, torch.Tensor) else torch.tensor(y, dtype=torch.float32, device=dev)
     params = p0_stack.clone().detach().float().to(dev) if isinstance(p0_stack, torch.Tensor) else torch.tensor(p0_stack, dtype=torch.float32, device=dev)
 
-    params = project_bounds(params, x_t)
+    params = project_bounds(params, x_t, y_t)
     params = params.requires_grad_(True)
 
     peak_lr = 1e-2
@@ -573,7 +573,7 @@ def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
         optimizer.step()
 
         with torch.no_grad():
-            params.data = project_bounds(params.data, x_t)
+            params.data = project_bounds(params.data, x_t, y_t)
 
         n_iter += 1
         if i % 50 == 0:
