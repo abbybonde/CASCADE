@@ -1,6 +1,6 @@
 ## Setup variables for general use
-File_Path="/storage/home/hcoda1/2/ebaker63/r-mcicerone3-0/Abby data/preprocessed_medfilter_replaced_myo3_polyme_35mWSC45mWProber_202602090655_PROCESS_202632_11_57_2_850702.h5"
-file = "replaced_myo3_p0lyme"
+File_Path="/YOUR/FILE/PATH/HERE" # path to your .h5 file containing the BCARS data
+file = "YOUR_FILE_NAME_HERE" # name for output files (without extension) — will be prefixed with "fitted_" and suffixed with timestamp for saving results
 
 ## wavenumber axis cropping parameters — adjust these to match the spectral range of your data (can be set after image loading to extract from dataset attributes)
 n_pix = 2304 # total number of pixels in spectral axis (before cropping)
@@ -118,6 +118,7 @@ def load_h5_file(filename, galvo=True, data_path=None, nrb_path=None, dark_path=
     data, nrb, dark, attrs = None, None, None, None
     found_data_path = None
 
+#Load file and auto-detect datasets for data, nrb, and dark (with fallbacks) — also load attributes from the data dataset for later use in fitting/plotting
     with h5py.File(filename, "r") as f:
         all_datasets = get_datasets(f)
         print("Available datasets:", all_datasets)
@@ -217,10 +218,15 @@ def save_h5_file(filename, data, nrb, dark, attrs, model, peak_params, SAVE_FOLD
         lazy5.alter.write_attr_dict(dset=dset, attr_dict=attrs, fid=fid)
     if dark is not None:
         lazy5.alter.write_attr_dict(dset='preprocessed_images/dark', attr_dict=attrs, fid=fid)
+def _sync_dev(dev):
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    elif dev.type == "mps":
+        torch.mps.synchronize()
+#Initialization of variables and loading of data, with manipulation of wavenumber axis based on prespecified cropping parameters
 now = datetime.now().strftime("%m%d%Y_%H:%M:%S")
 RAW_PATH = File_Path
 raw_data, nrb, dark, attrs = load_h5_file(RAW_PATH)
-# data, nrb, dark, attrs = load_h5_file("/home/adiering3/projects/Hvetch_ScaleMap/preprocessed_medfilter_hvetch_nodule_3a_05152025_02_PROCESS_20251210_13_21_4_384624.h5")
 pre_t0=time.perf_counter()
 filename = os.path.join(f"{file}_{now}")
 coeffs = attrs['Calib.a_vec']
@@ -236,8 +242,6 @@ crop_wn= wn[crop_start:crop_end] ## Crop the wavenumber axis to match the data
 wavenumbers= crop_wn
 
 data = raw_data[:, :, crop_start:crop_end]
-
-
 
 x = wavenumbers.copy()
 x = x.astype(np.float32)
@@ -277,29 +281,22 @@ _HI = torch.tensor([1.0, 4000.0, 50.0, 50.0], device=device)
 ttu.init_sweep_context(x_gpu, sigmas, gammas, device, widths)
 init_plot_context(x, widths)
 
-# Select a region from your already-loaded cube
-# You can change these bounds to benchmark/fit a different area
 # ── Batch fit directly on loaded BCARS cube (no RamanDataset) ───────────────────
 with torch.no_grad():
     torch.cuda.empty_cache()
 
-# Make sure sweep context exists for tidytorch_utils internals
-ttu.init_sweep_context(x_gpu, sigmas, gammas, device, widths)
-init_plot_context(x, widths)
-
-# Select a region from your already-loaded cube
-# You can change these bounds to benchmark/fit a different area
-
 data_crop=data[y_start:y_end, x_start:x_end, :]
 pixel_count=data_crop.shape[0]*data_crop.shape[1]
-
+#Initialize counter for time analysis and perform batch fitting on the cropped cube, with periodic progress updates and saving of intermediate results — also includes memory management to handle large cubes without running out of GPU memory
 print(time.perf_counter()-t_start)
 with open(f"Full_ROI_Fit_params_{file}.txt", "a") as f:
+    #Initialize lists to store timing results for analysis after processing the entire cube
     t_batch=[]
     tbp=[]
     t_fit=[]
     tfp=[]
     p_fit=[]
+    #Select region of interest (ROI) for fitting based on prespecified cropping parameters, and initialize an array to hold the processed spectra for the entire ROI
     processed_gpu=torch.as_tensor(np.zeros_like(data_crop), dtype=torch.float32)
     X0=0
     Y0=0
@@ -307,11 +304,8 @@ with open(f"Full_ROI_Fit_params_{file}.txt", "a") as f:
     Y1=np.sqrt(BATCH_SIZE).astype(int)
     process_count=0
     t_init=time.perf_counter()
+    #Iterate over the ROI in batches defined by the cropping parameters and BATCH_SIZE, performing the full fitting pipeline on each batch and saving the results back into the corresponding location in the processed_gpu array.
     while process_count<=pixel_count:
-
-
-        # X0, X1 = 160, 165
-        # Y0, Y1 = 295, 300
 
         # Build (B, n_pts) batch from existing data variable
         cube_roi = np.asarray(data_crop[X0:X1, Y0:Y1, :])
@@ -322,14 +316,6 @@ with open(f"Full_ROI_Fit_params_{file}.txt", "a") as f:
         print(f"ROI shape: {cube_roi.shape}  ->  batch spectra: {B} × {spectra_np.shape[1]}\n")
 
         spectra_gpu = torch.as_tensor(spectra_np, dtype=torch.float32, device=ttu._ctx_device)
-
-
-
-        def _sync_dev(dev):
-            if dev.type == "cuda":
-                torch.cuda.synchronize()
-            elif dev.type == "mps":
-                torch.mps.synchronize()
 
         # Warmup (optional, untimed)
         with torch.no_grad():
