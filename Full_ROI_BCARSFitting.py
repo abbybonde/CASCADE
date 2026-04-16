@@ -1,25 +1,25 @@
 ## Setup variables for general use
-File_Path="/YOUR/FILE/PATH/HERE" # path to your .h5 file containing the BCARS data
+File_Path="./data/preprocessed_medfilter_replaced_myo3_polyme_35mWSC45mWProber_202602090655_PROCESS_202632_11_57_2_850702.h5" # path to your .h5 file containing the BCARS data
 file = "YOUR_FILE_NAME_HERE" # name for output files (without extension) — will be prefixed with "fitted_" and suffixed with timestamp for saving results
 
 ## wavenumber axis cropping parameters — adjust these to match the spectral range of your data (can be set after image loading to extract from dataset attributes)
 n_pix = 2304 # total number of pixels in spectral axis (before cropping)
-crop_start = 550 # index to start cropping spectral axis (inclusive)
-crop_end = 1250 # index to end cropping spectral axis (exclusive)
+crop_start = 400 # index to start cropping spectral axis (inclusive)
+crop_end = 1800 # index to end cropping spectral axis (exclusive)
 BATCH_SIZE = 10000 # number of spectra to process in each batch, depends on memory constraints of your GPU — adjust as needed for larger/smaller cubes or different hardware
 ## spatial axis cropping parameters
-x_start = 175 # index to start cropping spatial axis 0 (inclusive)
-x_end = 375 # index to end cropping spatial axis 0 (exclusive)
+x_start = 0 # index to start cropping spatial axis 0 (inclusive)
+x_end = -1 # index to end cropping spatial axis 0 (exclusive)
 y_start = 0 # index to start cropping spatial axis 1 (inclusive)
-y_end = 330 # index to end cropping spatial axis 1 (exclusive)
+y_end = -1 # index to end cropping spatial axis 1 (exclusive)
 
 # Fit controls
-MAX_ITER_BATCH = 20000 # maximum iterations for Adam optimizer in each batch fit
-TOL_BATCH = 1 # tolerance for convergence in each batch fit (lower = more similar to input data but longer runtime)
-AMP_THR_BATCH = 1e-4 # amplitude threshold for peak detection in final pruning step (in same units as input spectra)
-MIN_SPACING_BATCH = 5.0 # minimum spacing between peaks in wavenumber units (used in both initial guess pruning and final deduplication)
+MAX_ITER_BATCH = 4000 # maximum iterations for Adam optimizer in each batch fit
+TOL_BATCH = 1e-5 # tolerance for convergence in each batch fit (lower = more similar to input data but longer runtime)
+AMP_THR_BATCH = 1e-6 # amplitude threshold for peak detection in final pruning step (in same units as input spectra)
+MIN_SPACING_BATCH = 3.0 # minimum spacing between peaks in wavenumber units (used in both initial guess pruning and final deduplication)
 MAX_PEAKS_BATCH = 200 # maximum number of peaks to fit per spectrum (after initial guess pruning)
-RESPONSE_THRESHOLD = 1e-5 # threshold for peak response in the initial voting step
+RESPONSE_THRESHOLD = 1e-4 # threshold for peak response in the initial voting step
 MIN_SCALE_VOTES = 5 # minimum number of scales that must vote for a peak to be considered in the initial guess step (lower = more peaks but longer runtime)
 
 # Progress checkpoint cadence (in spectra/pixels)
@@ -71,7 +71,7 @@ device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if
 
 import os
 if torch.cuda.is_available():
-    device_name=torch.cuda.get_device_name(1)
+    device_name=torch.cuda.get_device_name(0)
 else:
     device_name="cpu"
 print("device:", device_name)
@@ -238,10 +238,11 @@ probe *= 1e-7
 converted_nm = np.polyval(coeffs, np.arange(n_pix))
 converted_nm *= 0.0000001
 wn = 1/converted_nm - 1/probe
-crop_wn= wn[crop_start:crop_end] ## Crop the wavenumber axis to match the data
-wavenumbers= crop_wn
 
-data = raw_data[:, :, crop_start:crop_end]
+wn_mask = (wn >= crop_start) & (wn <= crop_end)
+wavenumbers = wn[wn_mask]
+indices = np.where(wn_mask)[0]
+data = raw_data[:, :, indices]
 
 x = wavenumbers.copy()
 x = x.astype(np.float32)
