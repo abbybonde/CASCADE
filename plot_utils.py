@@ -965,3 +965,144 @@ def plot_shape_rmse(x, y_true, gt_params, rec_params,
 
 
 
+
+def print_condition_stats(condition_labels, all_stats_batch,
+                          noise=None, sep=None, tol_noise=1e-6):
+    """
+    Print a nicely formatted summary of F1 / Precision / Recall for one or
+    all (noise, sep) conditions from the batch benchmark outputs.
+
+    Parameters
+    ----------
+    condition_labels : list[(noise, (sep_lo, sep_hi))]  — one entry per spectrum
+    all_stats_batch  : list[dict]  — matching stats dicts (keys: f1, precision, recall, tp, fp, fn)
+    noise            : float | None — if None, all noise levels are printed
+    sep              : (lo, hi) | None — if None, all sep levels are printed
+    tol_noise        : float — tolerance for float comparison of noise values
+    """
+    import numpy as np
+
+    def _sep_match(s, target):
+        return abs(s[0] - target[0]) < 1e-9 and abs(s[1] - target[1]) < 1e-9
+
+    # Collect unique conditions in sorted order
+    seen = {}
+    for lbl, st in zip(condition_labels, all_stats_batch):
+        n_val, s_val = float(lbl[0]), (float(lbl[1][0]), float(lbl[1][1]))
+        key = (n_val, s_val)
+        seen.setdefault(key, []).append(st)
+
+    # Filter to requested condition(s)
+    def _keep(key):
+        n_val, s_val = key
+        n_ok = (noise is None) or (abs(n_val - noise) < tol_noise)
+        s_ok = (sep   is None) or _sep_match(s_val, sep)
+        return n_ok and s_ok
+
+    keys = sorted([k for k in seen if _keep(k)], key=lambda k: (k[0], k[1][0]))
+
+    if not keys:
+        print("No matching conditions found.")
+        return
+
+    hdr = f"{'Noise':>8}  {'Sep range':>12}  {'N':>5}  "
+    hdr += f"{'F1':>7}  {'Prec':>7}  {'Rec':>7}  "
+    hdr += f"{'TP':>6}  {'FP':>6}  {'FN':>6}  {'F1 std':>7}"
+    print(hdr)
+    print("─" * len(hdr))
+
+    for (n_val, s_val) in keys:
+        stats = seen[(n_val, s_val)]
+        f1s   = np.array([s['f1']        for s in stats], dtype=float)
+        precs = np.array([s['precision']  for s in stats], dtype=float)
+        recs  = np.array([s['recall']     for s in stats], dtype=float)
+        tps   = np.array([s['tp']         for s in stats], dtype=float)
+        fps   = np.array([s['fp']         for s in stats], dtype=float)
+        fns   = np.array([s['fn']         for s in stats], dtype=float)
+
+        print(
+            f"{n_val:>8.4f}  "
+            f"{s_val[0]:.1f}–{s_val[1]:.1f}{'':>4}  "
+            f"{len(stats):>5}  "
+            f"{f1s.mean():>7.3f}  "
+            f"{precs.mean():>7.3f}  "
+            f"{recs.mean():>7.3f}  "
+            f"{tps.mean():>6.1f}  "
+            f"{fps.mean():>6.1f}  "
+            f"{fns.mean():>6.1f}  "
+            f"{f1s.std():>7.3f}"
+        )
+
+
+
+def colored_table_f1(condition_labels, all_stats_batch):
+
+    n_cond = len(condition_labels)
+    n_stats = len(all_stats_batch)
+
+    if n_cond == 0 or n_stats == 0:
+        raise ValueError("Empty benchmark outputs. Re-run the matrix benchmark cell.")
+
+    if n_stats == n_cond:
+        labels_aligned = condition_labels
+        repeat_factor = 1
+    elif (n_stats % n_cond) == 0:
+        repeat_factor = n_stats // n_cond
+        labels_aligned = condition_labels * repeat_factor
+        print(f"Detected {repeat_factor} benchmark repeats; plotting all repeats.")
+    else:
+        raise ValueError(
+            f"Length mismatch: condition_labels={n_cond} vs all_stats_batch={n_stats}. "
+            "Re-run the matrix benchmark cell to refresh outputs."
+        )
+
+    rows = []
+    for idx, ((noise, sep), st) in enumerate(zip(labels_aligned, all_stats_batch)):
+        rows.append({
+            'noise': float(noise),
+            'sep_lo': float(sep[0]),
+            'sep_hi': float(sep[1]),
+            'sep_mid': 0.5 * (float(sep[0]) + float(sep[1])),
+            'sep_label': f"{float(sep[0]):.1f}–{float(sep[1]):.1f}",
+            'f1': float(st.get('f1', np.nan)),
+            'repeat_idx': idx // n_cond,
+        })
+    df_bench = pd.DataFrame(rows)
+
+    # Keep consistent ordering
+    noise_levels_plot = sorted(df_bench['noise'].dropna().unique().tolist())
+    sep_labels_plot = sorted(
+        df_bench['sep_label'].dropna().unique().tolist(),
+        key=lambda s: float(s.split('–')[0])
+    )
+
+    # Mean F1 heatmap (matches style used later in notebook)
+    pivot_f1 = (
+        df_bench.groupby(['noise', 'sep_label'], as_index=False)['f1'].mean()
+                .pivot(index='noise', columns='sep_label', values='f1')
+                .reindex(index=noise_levels_plot, columns=sep_labels_plot)
+    )
+
+    fig, ax = plt.subplots(figsize=(len(sep_labels_plot) * 1.3 + 1.5, len(noise_levels_plot) * 0.9 + 1.8))
+    im = ax.imshow(pivot_f1.values, origin='upper', aspect='auto', vmin=0.0, vmax=1.0, cmap='viridis')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.03)
+    cbar.set_label('Mean F1 Score', fontsize=12)
+
+    ax.set_xticks(range(len(sep_labels_plot)))
+    ax.set_xticklabels(sep_labels_plot, rotation=30, ha='right', fontsize=10)
+    ax.set_yticks(range(len(noise_levels_plot)))
+    ax.set_yticklabels([f"{n:.3g}" for n in noise_levels_plot], fontsize=10)
+    ax.set_xlabel('Separability Range (σ-widths between peaks)', fontsize=12)
+    ax.set_ylabel('Noise Level (σ)', fontsize=12)
+    ax.set_title('Batch benchmark: Mean F1 (noise × separability)', fontsize=14, pad=10)
+
+    for i in range(len(noise_levels_plot)):
+        for j in range(len(sep_labels_plot)):
+            val = pivot_f1.values[i, j]
+            if np.isfinite(val):
+                color = 'white' if val < 0.45 else 'black'
+                ax.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=9, color=color, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('bench_f1_heatmap_noise_sep.png', dpi=150, bbox_inches='tight')
+    plt.show()

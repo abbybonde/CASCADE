@@ -30,6 +30,7 @@ utils_wavelet_geometry  — required when RamanDataset(return_pipeline_estimates
 """
 
 from math import gamma
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -1437,3 +1438,62 @@ class SampleWrapper(tuple):
                 f"(field index {idx} but len={len(self)})"
             )
         return self[idx]
+
+
+@dataclass
+class ScaleAmpConfig:
+    # Scale scoring
+    score_mode: str = "combined"      # "lor4", "displor", "combined"
+    lor_repr: str = "abs"             # "abs", "logabs", "linear"
+    lor_weight: float = 1.0
+    disp_weight: float = 1.0
+    use_quadratic_scale: bool = True  # ablatable quadratic interpolation
+    band_min_idx: Optional[int] = None
+    band_max_idx: Optional[int] = None
+
+    # DispLor signed-pair score
+    disp_pair_base_px: float = 2.0
+    disp_pair_slope: float = 0.0      # offset += slope * (sigma/dx)
+    disp_center_weight: float = 0.10
+    disp_balance_power: float = 1.0
+
+    # scale->sigma mapping
+    sigma_from_width_alpha: float = 1.0
+    sigma_from_width_beta: float = 0.0
+
+    # Non-iterative amplitude projection
+    gamma: float = 5.0
+    window_sigma_factor: float = 6.0
+    min_half_window: int = 6
+    kernel_normalize: str = "none"    # "none", "l2", "max"
+    clamp_amp_nonnegative: bool = True
+
+    # Optional post-filter
+    min_scale_score: float = -np.inf
+
+    # FWHM estimation mode
+    fwhm_mode: str = "wavelet"  # "wavelet", "halfheight", "hybrid"
+    fwhm_hybrid_wavelet_weight: float = 0.35
+    fwhm_hh_window_sigma_factor: float = 8.0
+    fwhm_hh_baseline_quantile: float = 0.10
+    fwhm_hh_min_height: float = 1e-6
+
+    # Control which parameters are surfaced by _run_pipeline_estimator / __getitem__
+    # Setting these to True adds sigma/gamma tensors to the dataset sample tuple.
+    return_sigma: bool = False
+    return_gamma: bool = False
+
+    # Optional bias correction (relative-error polynomial in log10(pred amp))
+    # e_hat(l) = c0 + c1*l + c2*l^2, l = log10(max(amp_pred, eps))
+    # corrected = raw / (1 + e_hat)
+    use_bias_correction: bool = False
+    bias_amp_c0: float = 0.0
+    bias_amp_c1: float = 0.0
+    bias_amp_c2: float = 0.0
+    bias_amp_x0: float = 0.0
+    bias_fwhm_c0: float = 0.0
+    bias_fwhm_c1: float = 0.0
+    bias_fwhm_c2: float = 0.0
+    bias_fwhm_x0: float = 0.0
+    bias_eps: float = 1e-6
+
