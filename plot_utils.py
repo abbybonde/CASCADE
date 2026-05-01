@@ -36,7 +36,6 @@ once before using _plot_sweep:
 """
 
 # Core
-import importlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -44,8 +43,8 @@ import matplotlib.lines as mlines
 from matplotlib.legend_handler import HandlerBase
 import torch
 
-from dataset_utils import voigt_peak, RamanDataset, SampleWrapper
-from tidytorch_utils import _fit_one, _cpu
+from dataset_utils import voigt_peak
+from tidytorch_utils import _cpu
 
 # ── Plot context — call init_plot_context() once before using _plot_sweep ─────
 _plt_x      = None  # (n_pts,) wavenumber axis
@@ -413,12 +412,12 @@ from matplotlib.lines import Line2D
 _JOURNAL_RC = {
     "font.family":       "sans-serif",
     "font.sans-serif":   ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size":         9,
-    "axes.titlesize":    10,
-    "axes.labelsize":    10,
-    "xtick.labelsize":   8.5,
-    "ytick.labelsize":   8.5,
-    "legend.fontsize":   8.5,
+    "font.size":         13,
+    "axes.titlesize":    15,
+    "axes.labelsize":    14,
+    "xtick.labelsize":   12,
+    "ytick.labelsize":   12,
+    "legend.fontsize":   12,
     "axes.linewidth":    0.8,
     "xtick.major.width": 0.6,
     "ytick.major.width": 0.6,
@@ -546,7 +545,8 @@ def _dual_violin(ax, data_a, data_b, labels, color_a, color_b,
             Line2D([], [], color=color_a, lw=3, alpha=0.6, label=label_a),
             Line2D([], [], color=color_b, lw=3, alpha=0.6, label=label_b),
         ],
-        loc="lower left", frameon=False, fontsize=8, handlelength=1.2,
+        loc="best", frameon=True, framealpha=0.85,
+        edgecolor="0.8", handlelength=1.2,
     )
 
 
@@ -641,16 +641,18 @@ def _dual_y_violin(ax, data_left, data_right, labels,
             Line2D([], [], color=color_left,  lw=3, alpha=0.6, label=ylabel_left),
             Line2D([], [], color=color_right, lw=3, alpha=0.6, label=ylabel_right),
         ],
-        loc="upper left", frameon=False, fontsize=8, handlelength=1.2,
+        loc="best", frameon=True, framealpha=0.85,
+        edgecolor="0.8", handlelength=1.2,
     )
 
     return ax2
 
 
 def _plot_sweep(param_name, param_values, all_results,
-                noise_fixed=0.01, sep_fixed=(1.0, 1.5),
-                example_idx=(0, -1), example_seed=123,
-                max_iter=2000, tol=1e-5, amp_thr=1e-2,
+                samples, params, spec_d_batch, precomp_stats,
+                condition_labels,
+                example_idx=(0, -1), amp_thr=1e-2,
+                example_fixed_val=None,
                 save_path=None):
     """Generate a journal-ready 3×2 figure summarising a parameter sweep.
 
@@ -661,32 +663,53 @@ def _plot_sweep(param_name, param_values, all_results,
     ------
     Row 0: Precision & Recall (dual violin)  |  F1 score (single violin)
     Row 1: Amp + Centre error (dual y-axis)  |  Shape RMSE (single violin)
-    Row 2: Example spectrum at param_values[example_idx[0]]  |  … [example_idx[1]]
+    Row 2: Example spectrum at samples[example_idx[0]]  |  … [example_idx[1]]
 
     Parameters
     ----------
-    param_name    : "noise_std" or "separability" (used for x-axis labelling
-                    and dataset construction inside example panels)
-    param_values  : list of parameter values that were swept; must match the
-                    keys used in all_results
-    all_results   : dict mapping each param value (or str(value)) to a list of
-                    metric dicts as returned by _match_peaks / _run_sweep
-    noise_fixed   : noise_std held constant when sweeping separability
-    sep_fixed     : separability_range held constant when sweeping noise
-    example_idx   : indices into param_values for the two example spectrum panels;
-                    negative indices count from the end
-    example_seed  : RNG seed for the example RamanDataset samples
-    max_iter      : Adam iteration budget for example-panel fitting
-    tol           : convergence tolerance for example-panel fitting
-    amp_thr       : minimum fitted amplitude to show a peak in example panels
-    save_path     : if not None, save the figure to this path before showing
+    param_name       : "noise_std" or "separability" (used for x-axis labelling)
+    param_values     : list of parameter values that were swept; must match the
+                       keys used in all_results
+    all_results      : dict mapping each param value (or str(value)) to a list of
+                       metric dicts as returned by _match_peaks
+    samples          : list of SampleWrapper objects (e.g. samples_bench_batch)
+    params           : (B, n_params) numpy array of fitted peak params
+    spec_d_batch     : (B, n_pts) numpy array of denoised spectra
+    precomp_stats    : flat list of stat dicts, one per sample (e.g. all_stats)
+    condition_labels : list of (noise_val, sep_tuple) per sample, same order as samples
+    example_idx      : indices into param_values for the two example panels;
+                       negative indices count from the end
+    amp_thr          : minimum fitted amplitude to show a peak in example panels
+    save_path        : if not None, save the figure to this path before showing
     """
+
+    def _first_sample_for_condition(target_pval):
+        """Return the index of the first sample matching target_pval and example_fixed_val."""
+        for j, (noise, sep) in enumerate(condition_labels):
+            sep_t = (float(sep[0]), float(sep[1]))
+            if param_name == "noise_std":
+                if float(noise) != float(target_pval):
+                    continue
+                if example_fixed_val is not None:
+                    if sep_t != (float(example_fixed_val[0]), float(example_fixed_val[1])):
+                        continue
+            else:
+                if sep_t != (float(target_pval[0]), float(target_pval[1])):
+                    continue
+                if example_fixed_val is not None:
+                    if float(noise) != float(example_fixed_val):
+                        continue
+            return j
+        return 0
 
     with mpl.rc_context(_JOURNAL_RC):
 
         keys   = [pv if param_name == "noise_std" else str(pv)
                   for pv in param_values]
-        labels = [str(pv) for pv in param_values]
+        if param_name == "noise_std":
+            labels = [str(pv) for pv in param_values]
+        else:
+            labels = [f"{pv[0]:.1f}" for pv in param_values]
         raw    = {m: [[s[m] for s in all_results[k]] for k in keys]
                   for m in ("precision", "recall", "f1",
                             "mean_amp_err", "mean_ctr_err",
@@ -696,15 +719,17 @@ def _plot_sweep(param_name, param_values, all_results,
         xlabel     = xlabel_map.get(param_name,
                                     param_name.replace("_", " ").capitalize())
 
-        ex_idx = [len(param_values) + i if i < 0 else i for i in example_idx]
-        n_ex   = len(ex_idx)
+        n_conditions = len(param_values)
+        ex_cond_idx  = [n_conditions + i if i < 0 else i for i in example_idx]
+        ex_idx       = [_first_sample_for_condition(param_values[c]) for c in ex_cond_idx]
+        n_ex         = len(ex_idx)
 
         # == Symmetric 2x3 via subfigures ======================================
         fig = plt.figure(figsize=(15, 9.0), dpi = 300)
         subfigs = fig.subfigures(
             3, 1,
             height_ratios=[1, 1, 1.15],
-            hspace=0.08,
+            hspace=0.12,
         )
 
         # =====================================================================
@@ -712,18 +737,22 @@ def _plot_sweep(param_name, param_values, all_results,
         # =====================================================================
         axes_r0 = subfigs[0].subplots(1, 2, gridspec_kw={"wspace": 0.35})
 
+        n_ticks = max(4, (len(labels) + 1) // 2)
+
         _dual_violin(
             axes_r0[0], raw["precision"], raw["recall"], labels,
             color_a=_PREC_COLOR, color_b=_REC_COLOR,
             label_a="Precision", label_b="Recall",
             ylabel="Score", xlabel=xlabel,
             ylim=(0, 1.08), title="Precision & Recall",
+            max_ticks=n_ticks,
         )
 
         _add_violin(
             axes_r0[1], raw["f1"], labels,
             ylabel="Score", xlabel=xlabel,
             ylim=(0, 1.08), color=_F1_COLOR, title="F1 score",
+            max_ticks=n_ticks,
         )
 
         # =====================================================================
@@ -738,12 +767,14 @@ def _plot_sweep(param_name, param_values, all_results,
             ylabel_right=u"Center error (cm\u207b\u00b9)",
             xlabel=xlabel,
             title="Peak parameter errors",
+            max_ticks=n_ticks,
         )
 
         _add_violin(
             axes_r1[1], raw["mean_shape_rmse"], labels,
             ylabel="Shape RMSE (norm.)", xlabel=xlabel,
             color=_RMSE_COLOR, title="Shape RMSE",
+            max_ticks=n_ticks,
         )
 
         # =====================================================================
@@ -753,26 +784,18 @@ def _plot_sweep(param_name, param_values, all_results,
         if n_ex == 1:
             axes_r2 = [axes_r2]
 
-        for i, idx in enumerate(ex_idx):
-            pval  = param_values[idx]
-            ds_kw = dict(noise_std=noise_fixed,
-                         separability_range=sep_fixed)
-            if param_name == "noise_std":
-                ds_kw["noise_std"] = pval
-            else:
-                ds_kw["separability_range"] = pval
-
-            ds_ex = RamanDataset(x=_plt_x, n_peaks=(8, 14), widths=_plt_widths,
-                                 n_samples=1, seed=example_seed, **ds_kw)
-            s_ex  = SampleWrapper(ds_ex[0])
-            stats, params_ex, spec_d = _fit_one(
-                s_ex, max_iter=max_iter, tol=tol, amp_threshold=amp_thr)
+        for i, (idx, cond_i) in enumerate(zip(ex_idx, ex_cond_idx)):
+            s_ex      = samples[idx]
+            params_ex = params[idx]
+            spec_d_ex = spec_d_batch[idx]
+            stats     = precomp_stats[idx]
+            pval      = param_values[cond_i]
 
             ax = axes_r2[i]
 
             ax.plot(_plt_x, _cpu(s_ex.spectrum), color=_SPEC_COLOR,
                     lw=1.6, alpha=0.75)
-            ax.plot(_plt_x, spec_d, color=_DENOISED_COLOR,
+            ax.plot(_plt_x, spec_d_ex, color=_DENOISED_COLOR,
                     lw=0.9, alpha=0.5, linestyle="--")
 
             for amp, ctr, sig, gam in zip(
@@ -794,21 +817,49 @@ def _plot_sweep(param_name, param_values, all_results,
             ax.set_xlim(ctrs.mean() - span, ctrs.mean() + span)
 
             if param_name == "noise_std":
-                lbl = str(pval)
+                lbl       = str(pval)
+                title_str = r"$\tilde{\sigma}_{spectrum}$" +f"= {lbl}"
+                cond_line = r"$\tilde{\sigma}_{spectrum}$" + f"= {lbl}"
+                fixed_line = (f"Sep = {example_fixed_val[0]:.1f}"
+                              if example_fixed_val is not None else "")
             else:
-                lbl = f"{pval[0]:.1f}-{pval[1]:.1f}"
+                lbl       = f"{pval[0]:.1f}\u2013{pval[1]:.1f}"
+                title_str = f"Separation = {lbl}"
+                cond_line = f"Sep = {lbl}"
+                fixed_line = (r"$\tilde{\sigma}_{spectrum}$" + f"= {example_fixed_val}"
+                              if example_fixed_val is not None else "")
 
-            ax.set_title(
-                f"{param_name} = {lbl}   |   "
-                f"F1 = {stats['f1']:.2f}   |   "
-                f"Shape RMSE = {stats['mean_shape_rmse']:.3f}\n"
-                f"TP = {stats['tp']}    FP = {stats['fp']}    FN = {stats['fn']}",
-                fontsize=8, linespacing=1.35, pad=8,
+            info_lines = [cond_line]
+            if fixed_line:
+                info_lines.append(fixed_line)
+            info_lines += [
+                f"F1 = {stats['f1']:.2f}",
+                f"Shape RMSE = {stats['mean_shape_rmse']:.3f}",
+                f"TP = {stats['tp']}  |  FP = {stats['fp']}  |  FN = {stats['fn']}",
+            ]
+
+            from matplotlib.patches import Patch
+            ax.legend(
+                handles=[Patch(visible=False) for _ in info_lines],
+                labels=info_lines,
+                loc="upper left", bbox_to_anchor=(0.02, 1.05),
+                frameon=True, framealpha=0.85, edgecolor="0.7",
+                fontsize=8,
+                handlelength=0, handletextpad=0,
             )
+            ax.set_title(title_str, pad=6)
             ax.set_xlabel(u"Raman shift (cm\u207b\u00b9)")
             ax.set_ylabel("Intensity" if i == 0 else "")
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
+
+        # -- A\u2013F panel labels --------------------------------------------------
+        all_axes = list(axes_r0) + list(axes_r1) + list(axes_r2)
+        for panel_label, ax in zip("ABCDEF", all_axes):
+            ax.text(-0.08, 1.08, panel_label,
+                    transform=ax.transAxes,
+                    fontsize=17, fontweight="bold",
+                    va="top", ha="left")
 
         # -- Spectra legend ----------------------------------------------------
         legend_handles = [
@@ -819,14 +870,14 @@ def _plot_sweep(param_name, param_values, all_results,
         ]
         subfigs[2].legend(
             handles=legend_handles, loc="lower center",
-            ncol=4, bbox_to_anchor=(0.5, -0.04),
+            ncol=4, bbox_to_anchor=(0.5, -0.17),
             frameon=False, columnspacing=1.5,
         )
 
         # -- n annotation ------------------------------------------------------
         n_per = len(next(iter(all_results.values())))
         fig.text(0.99, 1.005, f"n = {n_per} per level",
-                 ha="right", va="bottom", fontsize=7.5,
+                 ha="right", va="bottom", fontsize=14,
                  fontstyle="italic", transform=fig.transFigure)
 
         if save_path:
@@ -1104,5 +1155,5 @@ def colored_table_f1(condition_labels, all_stats_batch):
                 ax.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=9, color=color, fontweight='bold')
 
     plt.tight_layout()
-    plt.savefig('bench_f1_heatmap_noise_sep.png', dpi=150, bbox_inches='tight')
+    # plt.savefig('bench_f1_heatmap_noise_sep.png', dpi=150, bbox_inches='tight')
     plt.show()
