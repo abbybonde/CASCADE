@@ -2,3 +2,5 @@ samples_bench_batch_29042026_samples=6825_21_x_noise_0.0-0.1__13_x_sep_(0.6, 0.6
 synthetic_fit_20260501_6825x_samples_tol=1e-05_checkpoint.pt
 synthetic_fit_20260501_6825x_samples_tol=1e-05.pt
 per_peak_contour.png
+samples=27300_bench_batch_02052026_21_x_noise_0.0-0.1__13_x_sep_(0.6, 0.6)-(3.0, 3.0).pt
+synthetic_fit_20260502_27300x_samples_tol=1e-05_checkpoint.pt

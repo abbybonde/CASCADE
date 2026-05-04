@@ -273,6 +273,37 @@ def voigt_peak(x, center, amp, sigma, gamma=5.0, Real=False):
     return amp * profile / (peak_ref + 1e-12)
 
 
+def _generate_multipeak_both(x, centers, amps_lor, amps_disp, sigmas, gammas):
+    """Compute absorptive (lor) and dispersive (disp) spectra in a single wofz call."""
+    if wofz is None:
+        raise ImportError("scipy.special.wofz is required")
+
+    x64 = x.astype(np.float64) if x.dtype != np.float64 else x
+    c64 = np.asarray(centers, dtype=np.float64)
+    sl64 = np.asarray(amps_lor, dtype=np.float64)
+    sd64 = np.asarray(amps_disp, dtype=np.float64)
+    sig64 = np.asarray(sigmas, dtype=np.float64)
+    gam64 = np.asarray(gammas, dtype=np.float64)
+
+    sqrt2 = np.sqrt(2.0)
+    z = (
+        (x64[np.newaxis, :] - c64[:, np.newaxis]) + 1j * gam64[:, np.newaxis]
+    ) / (sig64[:, np.newaxis] * sqrt2)               # (n_peaks, n_pts)
+
+    w = wofz(z)                                       # one wofz call for both
+
+    norm = sig64[:, np.newaxis] * np.sqrt(2.0 * np.pi)
+    absorptive = np.real(w) / norm                    # (n_peaks, n_pts)
+    dispersive = np.imag(w) / norm                    # (n_peaks, n_pts)
+
+    abs_refs = np.max(absorptive, axis=1, keepdims=True) + 1e-12
+    dis_refs = np.max(np.abs(dispersive), axis=1, keepdims=True) + 1e-12
+
+    y_lor  = (sl64[:, np.newaxis] * absorptive / abs_refs).sum(axis=0).astype(np.float32)
+    y_disp = (sd64[:, np.newaxis] * dispersive / dis_refs).sum(axis=0).astype(np.float32)
+    return y_lor, y_disp
+
+
 def generate_multipeak_Raman(x, centers, amps, sigmas, gammas, noise_std=0.0, Real=False):
     """Synthesise a multi-peak Raman spectrum as a sum of Voigt profiles.
 
@@ -290,17 +321,42 @@ def generate_multipeak_Raman(x, centers, amps, sigmas, gammas, noise_std=0.0, Re
     -------
     y : (n_pts,) float32 spectrum
     """
+    if wofz is None:
+        raise ImportError("scipy.special.wofz is required for generate_multipeak_Raman")
+
     x = np.asarray(x, dtype=np.float32)
-    centers = np.asarray(centers)
-    amps = np.asarray(amps)
-    sigmas = np.asarray(sigmas)
-    gammas = np.asarray(gammas) if np.ndim(gammas) > 0 else np.full_like(centers, float(gammas))
+    centers = np.asarray(centers, dtype=np.float64)
+    amps = np.asarray(amps, dtype=np.float64)
+    sigmas = np.asarray(sigmas, dtype=np.float64)
+    gammas = np.asarray(gammas, dtype=np.float64) if np.ndim(gammas) > 0 else np.full_like(centers, float(gammas))
 
-    assert len(centers) == len(amps) == len(sigmas)
+    n_peaks = len(centers)
+    assert n_peaks == len(amps) == len(sigmas)
 
-    y = np.zeros_like(x)
-    for c, a, s, g in zip(centers, amps, sigmas, gammas):
-        y += voigt_peak(x, c, a, s, g, Real)
+    if n_peaks == 0:
+        y = np.zeros_like(x)
+        if noise_std > 0:
+            y += noise_std * np.random.randn(len(x))
+        return y.astype(np.float32)
+
+    # Vectorised: compute wofz for all peaks at once — shape (n_peaks, n_pts)
+    sqrt2 = np.sqrt(2.0)
+    z = (
+        (x[np.newaxis, :].astype(np.float64) - centers[:, np.newaxis])
+        + 1j * gammas[:, np.newaxis]
+    ) / (sigmas[:, np.newaxis] * sqrt2)                # (n_peaks, n_pts)
+
+    w = wofz(z)                                        # (n_peaks, n_pts) complex
+
+    norm = sigmas[:, np.newaxis] * np.sqrt(2.0 * np.pi)
+    if Real:
+        profiles = np.imag(w) / norm                   # (n_peaks, n_pts)
+        peak_refs = np.max(np.abs(profiles), axis=1, keepdims=True) + 1e-12
+    else:
+        profiles = np.real(w) / norm                   # (n_peaks, n_pts)
+        peak_refs = np.max(profiles, axis=1, keepdims=True) + 1e-12
+
+    y = (amps[:, np.newaxis] * profiles / peak_refs).sum(axis=0)
 
     if noise_std > 0:
         y += noise_std * np.random.randn(len(x))
@@ -592,6 +648,7 @@ class RamanDataset(Dataset):
         rng=None,
         seed=42,
         Real=False,
+        skip_transforms=False,
     ):
         """Construct a synthetic Raman dataset.
 
@@ -757,6 +814,9 @@ class RamanDataset(Dataset):
         self.disp_lor_support_factor = float(disp_lor_support_factor)
         self.disp_lor_pad_mode = str(disp_lor_pad_mode)
         self.disp_lor_mask_coi = bool(disp_lor_mask_coi)
+        self.skip_transforms = bool(skip_transforms)
+        if self.skip_transforms and (return_both_wavelets or return_priors or return_pipeline_estimates):
+            raise ValueError("skip_transforms=True is incompatible with return_both_wavelets, return_priors, or return_pipeline_estimates")
         self.return_both_wavelets = bool(return_both_wavelets)
         self.return_priors = bool(return_priors)
         self.ridge_prior_cfg = ridge_prior_cfg
@@ -1149,53 +1209,60 @@ class RamanDataset(Dataset):
             if vals:
                 S_peak[i] = min(vals)
 
-        y_lor = generate_multipeak_Raman(self.x, centers, amps_lor, sigmas, gammas, Real=False)
-        y_disp = generate_multipeak_Raman(self.x, centers, amps_disp, sigmas, gammas, Real=True)
+        y_lor, y_disp = _generate_multipeak_both(self.x, centers, amps_lor, amps_disp, sigmas, gammas)
         y = y_disp if self.Real else y_lor
         if self.noise_std > 0:
             y += self.noise_std * rng.standard_normal(len(y)).astype(np.float32)
 
-        W_lor = multiscale_lorentz4_transform(self.x, y_lor, self.widths)
-        W_disp = cwt_dispersive_lorentzian(
-            y_disp,
-            self.x,
-            self.widths,
-            support_factor=self.disp_lor_support_factor,
-            pad_mode=self.disp_lor_pad_mode,
-            mask_coi=self.disp_lor_mask_coi,
-        )
-
-        if self.wavelet == "Lor4":
-            W = W_lor
-        elif self.wavelet == "MexHat":
-            W = multiscale_mexhat_transform(self.x, y, self.widths)
+        if self.skip_transforms:
+            W = None
+            W_lor = None
+            W_disp = None
+            W_lor_out = None
+            W_disp_out = None
+            target = None
         else:
-            W = W_disp
-        W = self._apply_repr_for_wavelet(W, self.wavelet)
-        W /= (np.std(W) + 1e-12)
-
-        W_lor_out = self._apply_repr_for_wavelet(W_lor, "Lor4")
-        W_lor_out /= (np.std(W_lor_out) + 1e-12)
-        W_disp_out = self._apply_repr_for_wavelet(W_disp, "DispLor")
-        W_disp_out /= (np.std(W_disp_out) + 1e-12)
-
-        priors_map = None
-        if self.return_priors:
-            # Priors are derived from signed DispLor response (linear repr).
-            priors_map = self._compute_prior_maps(W_disp.astype(np.float32))
-
-        target = np.zeros_like(W, dtype=np.float32)
-        for c, s in zip(centers, sigmas):
-            target += multiscale_anisotropic_target(
+            W_lor = multiscale_lorentz4_transform(self.x, y_lor, self.widths)
+            W_disp = cwt_dispersive_lorentzian(
+                y_disp,
                 self.x,
                 self.widths,
-                float(c),
-                float(s),
-                gamma_x=self.target_gamma_x,
-                sigma_s=self.target_sigma_s,
-                scale_spread=self.target_scale_spread,
+                support_factor=self.disp_lor_support_factor,
+                pad_mode=self.disp_lor_pad_mode,
+                mask_coi=self.disp_lor_mask_coi,
             )
-        target /= target.sum() + 1e-12
+
+            if self.wavelet == "Lor4":
+                W = W_lor
+            elif self.wavelet == "MexHat":
+                W = multiscale_mexhat_transform(self.x, y, self.widths)
+            else:
+                W = W_disp
+            W = self._apply_repr_for_wavelet(W, self.wavelet)
+            W /= (np.std(W) + 1e-12)
+
+            W_lor_out = self._apply_repr_for_wavelet(W_lor, "Lor4")
+            W_lor_out /= (np.std(W_lor_out) + 1e-12)
+            W_disp_out = self._apply_repr_for_wavelet(W_disp, "DispLor")
+            W_disp_out /= (np.std(W_disp_out) + 1e-12)
+
+            target = np.zeros((len(self.widths), len(self.x)), dtype=np.float32)
+            for c, s in zip(centers, sigmas):
+                target += multiscale_anisotropic_target(
+                    self.x,
+                    self.widths,
+                    float(c),
+                    float(s),
+                    gamma_x=self.target_gamma_x,
+                    sigma_s=self.target_sigma_s,
+                    scale_spread=self.target_scale_spread,
+                )
+            target /= target.sum() + 1e-12
+
+        priors_map = None
+        if self.return_priors and not self.skip_transforms:
+            # Priors are derived from signed DispLor response (linear repr).
+            priors_map = self._compute_prior_maps(W_disp.astype(np.float32))
 
         true_xs = np.array(
             [int(np.argmin(np.abs(self.x - c))) for c in centers],
@@ -1203,8 +1270,8 @@ class RamanDataset(Dataset):
         )
 
         base = (
-            torch.tensor(W, dtype=torch.float32),
-            torch.tensor(target, dtype=torch.float32),
+            torch.tensor(W, dtype=torch.float32) if W is not None else None,
+            torch.tensor(target, dtype=torch.float32) if target is not None else None,
             torch.tensor(true_xs, dtype=torch.long),
             torch.tensor(centers, dtype=torch.float32),
             torch.tensor(amps_disp if self.Real else amps_lor, dtype=torch.float32),
@@ -1213,16 +1280,15 @@ class RamanDataset(Dataset):
             torch.tensor(sigmas, dtype=torch.float32),
             torch.tensor(y, dtype=torch.float32),
             torch.tensor(gammas, dtype=torch.float32),
-
         )
 
-        if self.return_both_wavelets:
+        if self.return_both_wavelets and not self.skip_transforms:
             base = base + (
                 torch.tensor(W_lor_out, dtype=torch.float32),
                 torch.tensor(W_disp_out, dtype=torch.float32),
             )
 
-        if self.return_priors:
+        if self.return_priors and not self.skip_transforms:
             base = base + (torch.tensor(priors_map, dtype=torch.float32),)
 
         if self.return_pipeline_estimates:
