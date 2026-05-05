@@ -1394,6 +1394,163 @@ def _fit_batch_adam(spectra: torch.Tensor,
     return params.detach()
 
 
+# ── Post-fit analysis ─────────────────────────────────────────────────────────
+
+def estimate_fit_characteristics(spectrum, fitted_params, x, amp_threshold=1e-2):
+    """Estimate noise and peak-separation characteristics from a fitted spectrum.
+
+    Given an experimentally measured spectrum and the flat fitted-parameter vector
+    produced by the CASCADE fitting pipeline, this function works backwards to
+    recover the noise and separability metrics that the SyntheticData benchmark
+    sweeps over — so you can locate your dataset in that parameter space.
+
+    Parameters
+    ----------
+    spectrum : array-like, shape (n_pts,)
+        The original (raw, un-denoised) measured spectrum.
+    fitted_params : array-like, shape (max_peaks * 4,)
+        Flat parameter vector ``[amp, ctr, sigma, gamma, ...]`` as returned by
+        the fitting pipeline (e.g. from ``_fit_batch_adam`` or ``_fit_one``).
+        Padding slots (amplitude ≤ ``amp_threshold``) are ignored.
+    x : array-like, shape (n_pts,)
+        Spectral axis values (wavenumbers, cm⁻¹, etc.).
+    amp_threshold : float, optional
+        Minimum amplitude for a peak to be considered valid (default 1e-2).
+
+    Returns
+    -------
+    dict with keys:
+
+    ``noise_std``
+        Estimated noise standard deviation, computed as ``std(spectrum - model)``.
+        Matches the ``noise_std`` parameter of ``RamanDataset``.
+    ``noise_to_peak_ratio``
+        ``noise_std / max_fitted_amplitude``.  Corresponds to the per-peak
+        ``noise / amplitude`` axis used in the SyntheticData detection-rate
+        contour plots.
+    ``n_peaks``
+        Number of peaks with amplitude > ``amp_threshold``.
+    ``peak_centers`` : ndarray (n_peaks,)
+        Fitted peak centre positions, sorted in ascending order.
+    ``peak_amplitudes`` : ndarray (n_peaks,)
+        Fitted peak amplitudes, sorted by centre position.
+    ``peak_fwhm`` : ndarray (n_peaks,)
+        Thompson-Cox-Hastings combined FWHM for each peak (same formula as
+        ``pseudo_voigt`` uses internally).
+    ``pair_separability`` : ndarray (n_peaks - 1,)
+        For each adjacent pair of peaks (sorted by centre):
+        ``distance / max(fwhm_i, fwhm_j)``.  Equivalent to ``S_adj`` in the
+        synthetic dataset — values > 1 mean peaks are more than one FWHM apart.
+        Empty array when fewer than 2 peaks are present.
+    ``peak_separability`` : ndarray (n_peaks,)
+        Per-peak separability: the minimum ``pair_separability`` of the adjacent
+        pairs that include that peak.  Isolated peaks (no neighbours) get
+        ``np.inf``.  Matches the ``separability`` field in ``RamanSample``.
+    ``min_separability`` : float
+        Minimum value of ``pair_separability`` (``np.inf`` when < 2 peaks).
+    ``median_separability`` : float
+        Median of ``pair_separability`` (``np.nan`` when < 2 peaks).
+    ``mean_separability`` : float
+        Mean of ``pair_separability`` (``np.nan`` when < 2 peaks).
+    ``fitted_model`` : ndarray (n_pts,)
+        The reconstructed spectrum from the fitted parameters.
+    ``residuals`` : ndarray (n_pts,)
+        ``spectrum - fitted_model``.
+    """
+    x_np  = np.asarray(x,            dtype=np.float64)
+    y_np  = np.asarray(spectrum,     dtype=np.float64)
+    p_np  = np.asarray(fitted_params, dtype=np.float64).reshape(-1, 4)
+
+    # ── Extract valid peaks ───────────────────────────────────────────────────
+    valid = p_np[:, 0] > amp_threshold
+    p_v   = p_np[valid]           # (n_peaks, 4): [amp, ctr, sigma, gamma]
+
+    n_peaks = int(valid.sum())
+
+    # Sort by centre position (ascending) to match synthetic-data convention.
+    order  = np.argsort(p_v[:, 1])
+    p_v    = p_v[order]
+
+    amps   = p_v[:, 0]
+    ctrs   = p_v[:, 1]
+    sigs   = np.clip(p_v[:, 2], 1e-9, None)
+    gams   = np.clip(p_v[:, 3], 1e-9, None)
+
+    # ── Thompson-Cox-Hastings combined FWHM ──────────────────────────────────
+    fwhm_g = 2.35482 * sigs
+    fwhm_l = 2.0     * gams
+    fwhm_v = (
+        fwhm_g**5
+        + 2.69269 * fwhm_g**4 * fwhm_l
+        + 2.42843 * fwhm_g**3 * fwhm_l**2
+        + 4.47163 * fwhm_g**2 * fwhm_l**3
+        + 0.07842 * fwhm_g    * fwhm_l**4
+        + fwhm_l**5
+    ) ** 0.2
+    fwhm_v = np.clip(fwhm_v, 1e-9, None)
+
+    # ── Reconstruct model spectrum ────────────────────────────────────────────
+    model = np.zeros_like(x_np)
+    for k in range(n_peaks):
+        z        = (x_np - ctrs[k]) / fwhm_v[k]
+        ratio_k  = fwhm_l[k] / fwhm_v[k]
+        eta_k    = np.clip(
+            1.36603 * ratio_k - 0.47719 * ratio_k**2 + 0.11116 * ratio_k**3,
+            0.0, 1.0,
+        )
+        gaussian    = np.exp(-4.0 * np.log(2.0) * z**2)
+        lorentzian  = 1.0 / (1.0 + 4.0 * z**2)
+        model      += amps[k] * (eta_k * lorentzian + (1.0 - eta_k) * gaussian)
+
+    # ── Noise estimation ──────────────────────────────────────────────────────
+    residuals       = y_np - model
+    noise_std       = float(np.std(residuals))
+    max_amp         = float(np.max(amps)) if n_peaks > 0 else 1.0
+    noise_to_peak   = noise_std / max(max_amp, 1e-12)
+
+    # ── Separability ─────────────────────────────────────────────────────────
+    if n_peaks >= 2:
+        distances        = np.diff(ctrs)                          # (n_peaks-1,)
+        w_eff            = np.maximum(fwhm_v[:-1], fwhm_v[1:])   # max FWHM per pair
+        pair_sep         = distances / w_eff                      # (n_peaks-1,)
+
+        peak_sep         = np.full(n_peaks, np.inf, dtype=np.float64)
+        for i in range(n_peaks):
+            neighbours = []
+            if i > 0:
+                neighbours.append(pair_sep[i - 1])
+            if i < n_peaks - 1:
+                neighbours.append(pair_sep[i])
+            if neighbours:
+                peak_sep[i] = min(neighbours)
+
+        min_sep    = float(np.min(pair_sep))
+        median_sep = float(np.median(pair_sep))
+        mean_sep   = float(np.mean(pair_sep))
+    else:
+        pair_sep   = np.empty(0, dtype=np.float64)
+        peak_sep   = np.full(n_peaks, np.inf, dtype=np.float64)
+        min_sep    = np.inf
+        median_sep = np.nan
+        mean_sep   = np.nan
+
+    return {
+        "noise_std":           noise_std,
+        "noise_to_peak_ratio": noise_to_peak,
+        "n_peaks":             n_peaks,
+        "peak_centers":        ctrs.astype(np.float32),
+        "peak_amplitudes":     amps.astype(np.float32),
+        "peak_fwhm":           fwhm_v.astype(np.float32),
+        "pair_separability":   pair_sep.astype(np.float32),
+        "peak_separability":   peak_sep.astype(np.float32),
+        "min_separability":    min_sep,
+        "median_separability": median_sep,
+        "mean_separability":   mean_sep,
+        "fitted_model":        model.astype(np.float32),
+        "residuals":           residuals.astype(np.float32),
+    }
+
+
 # ── Main sweep function ───────────────────────────────────────────────────────
 
 def _run_sweep(param_name, param_values, n_samples=30, seed=42,
