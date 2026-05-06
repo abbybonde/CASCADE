@@ -631,6 +631,20 @@ class CascadeFitGUI(tk.Tk):
 
     def _precompute_fit_ctx(self):
         """Build wavelet bank from the current WN axis. Runs in the fit thread."""
+        # ── PyInstaller freeze guard ──────────────────────────────────────────
+        # The @torch.compile(fullgraph=True) decorators in tidytorch_utils run
+        # at import time.  In a frozen executable the Dynamo/Triton JIT compiler
+        # cannot find the files it needs, so replace torch.compile with a no-op
+        # *before* tidytorch_utils is first imported.  The functions then run in
+        # standard eager mode — slightly slower but fully functional.
+        if getattr(sys, "frozen", False):
+            import torch as _torch
+            if not getattr(_torch, "_cascade_compile_patched", False):
+                _torch.compile = lambda fn=None, *_a, **_kw: (
+                    fn if fn is not None else lambda f: f
+                )
+                _torch._cascade_compile_patched = True
+
         import torch
         import tidytorch_utils as ttu
 
