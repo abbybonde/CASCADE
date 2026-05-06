@@ -1,0 +1,33 @@
+# CASCADE — fitting_gui.py dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# PyTorch must be installed separately because the right index URL depends on
+# your hardware (CUDA version, CPU-only, or Apple MPS).  See:
+#   https://pytorch.org/get-started/locally/
+#
+# Quick examples:
+#   CPU-only  : pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.x : pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   Apple MPS : pip install torch          # default PyPI wheel includes MPS
+
+# ── Core numerical stack ──────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10           # voigt_peak (scipy.special.wofz), linear_sum_assignment
+
+# ── Plotting (TkAgg backend ships with matplotlib) ───────────────────────────
+matplotlib>=3.7
+pandas>=1.5           # used in plot_utils._plot_sweep
+
+# ── HDF5 I/O ─────────────────────────────────────────────────────────────────
+h5py>=3.8
+lazy5>=0.2            # load_h5_file / save_h5_file in dataset_utils
+
+# ── GUI toolkit ───────────────────────────────────────────────────────────────
+# tkinter ships with the standard CPython distribution on Windows and macOS.
+# On Debian/Ubuntu Linux install the system package if it is missing:
+#   sudo apt install python3-tk
+
+# ── Deep learning framework (install separately — see note above) ─────────────
+# torch>=2.0
