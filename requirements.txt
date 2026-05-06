@@ -22,7 +22,7 @@ pandas>=1.5           # used in plot_utils._plot_sweep
 
 # ── HDF5 I/O ─────────────────────────────────────────────────────────────────
 h5py>=3.8
-lazy5>=0.2            # load_h5_file / save_h5_file in dataset_utils
+LazyHDF5>=0.2            # load_h5_file / save_h5_file in dataset_utils
 
 # ── GUI toolkit ───────────────────────────────────────────────────────────────
 # tkinter ships with the standard CPython distribution on Windows and macOS.
