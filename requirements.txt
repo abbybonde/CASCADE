@@ -3,14 +3,20 @@
 # Install with:
 #   pip install -r requirements.txt
 #
-# PyTorch must be installed separately because the right index URL depends on
-# your hardware (CUDA version, CPU-only, or Apple MPS).  See:
-#   https://pytorch.org/get-started/locally/
+# PyTorch is the only non-standard scientific dependency.
+# TensorFlow is NOT used. CUDA is NOT required — CPU-only PyTorch works
+# for all fitting operations in the GUI.
 #
-# Quick examples:
-#   CPU-only  : pip install torch --index-url https://download.pytorch.org/whl/cpu
-#   CUDA 12.x : pip install torch --index-url https://download.pytorch.org/whl/cu121
-#   Apple MPS : pip install torch          # default PyPI wheel includes MPS
+# Install PyTorch separately because the correct wheel depends on your platform:
+#
+#   CPU-only (recommended for the GUI, smallest download ~250 MB):
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+#   CUDA 12.x (if you want GPU acceleration for large batch fits):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+#   Apple Silicon (MPS acceleration included in the default wheel):
+#     pip install torch
 
 # ── Core numerical stack ──────────────────────────────────────────────────────
 numpy>=1.24
