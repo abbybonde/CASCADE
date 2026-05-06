@@ -1934,3 +1934,26 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
                          x_arr=_ctx_x)
     return stats, params_np, _cpu(spec_d)
 
+
+
+def print_fit_characteristics(fc):
+    sep = fc['pair_separability']
+    print("┌─── Fit Characteristics ───────────────────────────────┐")
+    print(f"│  Peaks detected   : {fc['n_peaks']:<5d}")
+    print(f"│  Noise σ          : {fc['noise_std']:.4f}")
+    print(f"│  Noise / max amp  : {fc['noise_to_peak_ratio']:.4f}")
+    print(f"│  Separability     : min={fc['min_separability']:.2f}  "
+          f"med={fc['median_separability']:.2f}  "
+          f"mean={fc['mean_separability']:.2f}")
+    print("│")
+    print("│  Peak summary (sorted by centre):")
+    print("│  {:>6}  {:>8}  {:>8}  {:>8}".format("centre", "amp", "FWHM", "sep"))
+    for k in range(fc['n_peaks']):
+        s = f"{fc['peak_separability'][k]:.2f}" if np.isfinite(fc['peak_separability'][k]) else "  inf"
+        print("│  {:>6.1f}  {:>8.4f}  {:>8.3f}  {:>8}".format(
+            fc['peak_centers'][k],
+            fc['peak_amplitudes'][k],
+            fc['peak_fwhm'][k],
+            s,
+        ))
+    print("└───────────────────────────────────────────────────────┘")
