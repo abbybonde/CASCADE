@@ -646,7 +646,7 @@ class CascadeFitGUI(tk.Tk):
                 _torch._cascade_compile_patched = True
 
         import torch
-        import tidytorch_utils as ttu
+        import cascade.tidytorch_utils as ttu
 
         x      = self._wn
         dx     = float((x[-1] - x[0]) / max(len(x) - 1, 1))
@@ -673,7 +673,7 @@ class CascadeFitGUI(tk.Tk):
     def _run_one_pixel(self, row: int, col: int, fp: dict) -> dict:
         """Fit one pixel and return a result dict. Runs in a worker thread."""
         import torch
-        import tidytorch_utils as ttu
+        import cascade.tidytorch_utils as ttu
 
         if not self._fit_ctx_ready:
             self._precompute_fit_ctx()

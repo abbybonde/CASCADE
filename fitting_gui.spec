@@ -45,7 +45,7 @@ _scipy_d,   _scipy_b,   _scipy_h   = collect_all("scipy")
 _lazy5_d,   _lazy5_b,   _lazy5_h   = collect_all("lazy5")
 
 a = Analysis(
-    ["fitting_gui.py"],
+    ["cascade/fitting_gui.py"],
     pathex=["."],
 
     binaries=(
@@ -54,20 +54,20 @@ a = Analysis(
 
     datas=(
         _torch_d + _numpy_d + _mpl_d + _h5py_d + _scipy_d + _lazy5_d
-        # Local CASCADE source modules — copied to the bundle root so that
-        # `import tidytorch_utils` / `import dataset_utils` resolve correctly.
-        + [("tidytorch_utils.py", "."),
-           ("dataset_utils.py",   "."),
-           ("plot_utils.py",      ".")]
+        # CASCADE package — copy the whole cascade/ directory into the bundle.
+        + [("cascade", "cascade")]
     ),
 
     hiddenimports=(
         _torch_h + _numpy_h + _mpl_h + _h5py_h + _scipy_h + _lazy5_h
         + [
-            # CASCADE local modules (lazy-imported inside functions)
-            "tidytorch_utils",
-            "dataset_utils",
-            "plot_utils",
+            # CASCADE package modules (lazy-imported inside functions)
+            "cascade",
+            "cascade.tidytorch_utils",
+            "cascade.dataset_utils",
+            "cascade.plot_utils",
+            "cascade.fitting_gui",
+            "cascade.metrics_gui",
 
             # lazy5 submodules used by dataset_utils
             "lazy5.inspect",
