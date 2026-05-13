@@ -45,7 +45,7 @@ def _get_estimate_fn():
     global _ESTIMATE_FN
     if _ESTIMATE_FN is None:
         try:
-            from tidytorch_utils import estimate_fit_characteristics  # noqa: PLC0415
+            from cascade.tidytorch_utils import estimate_fit_characteristics  # noqa: PLC0415
             _ESTIMATE_FN = estimate_fit_characteristics
         except ImportError as exc:
             messagebox.showerror(

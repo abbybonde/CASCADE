@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "cascade-bcars"
+version = "0.1.0"
+description = "BCARS hyperspectral spectral fitting — peak detection, Adam optimisation, and fit metrics"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "pandas>=1.5",
+    "h5py>=3.8",
+    "lazy5>=0.2",
+    # PyTorch must be installed separately — the correct wheel depends on platform.
+    # CPU-only (recommended):
+    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+    # CUDA 12.x:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cu121
+    # Apple Silicon (MPS):
+    #   pip install torch
+]
+
+[project.scripts]
+cascade-fit     = "cascade.fitting_gui:launch"
+cascade-metrics = "cascade.metrics_gui:launch"
+
+[tool.setuptools.packages.find]
+include = ["cascade*"]

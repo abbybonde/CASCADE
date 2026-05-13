@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from dataset_utils import RamanDataset, voigt_peak
+from .dataset_utils import RamanDataset, voigt_peak
 
 try:
     from scipy.optimize import linear_sum_assignment

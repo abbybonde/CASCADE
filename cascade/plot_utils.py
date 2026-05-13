@@ -43,8 +43,8 @@ import matplotlib.lines as mlines
 from matplotlib.legend_handler import HandlerBase
 import torch
 
-from dataset_utils import voigt_peak
-from tidytorch_utils import _cpu
+from .dataset_utils import voigt_peak
+from .tidytorch_utils import _cpu
 
 # ── Plot context — call init_plot_context() once before using _plot_sweep ─────
 _plt_x      = None  # (n_pts,) wavenumber axis
