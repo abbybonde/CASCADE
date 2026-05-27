@@ -1,0 +1,3 @@
+[console_scripts]
+cascade-fit = cascade.fitting_gui:launch
+cascade-metrics = cascade.metrics_gui:launch
