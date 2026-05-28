@@ -1410,13 +1410,18 @@ def _fit_batch_adam(
     progress_prefix: str = "fit",
 ) -> torch.Tensor:
     B, npq = p0_batch.shape
+    n_peaks = npq // 4
+    _lo = _LO.repeat(n_peaks)   # (npq,)  — used for flat clamp_ only
+    _hi = _HI.repeat(n_peaks)   # (npq,)
 
     # --- Initial bounds projection with NaN guard ---
     p_init = p0_batch.reshape(B, -1, 4)
     clamped = torch.clamp(p_init, _LO, _HI)
     params = torch.where(torch.isfinite(clamped), clamped, p_init).reshape(B, npq)
     params = params.detach().requires_grad_(True)
-
+    n_pts   = spectra.shape[-1]        # e.g. 800
+    # peak_lr = 1e-2 / n_pts             # 1e-2/800 ≈ 1.25e-5
+    # end_lr  = 1e-5 / n_pts
     peak_lr = 1e-2
     end_lr  = 1e-5
     warmup  = 100
@@ -1452,7 +1457,8 @@ def _fit_batch_adam(
         optimizer.zero_grad()
 
         model = _compute_model_batch(params, x)        # (B, n_pts)
-        loss  = ((model - spectra) ** 2).mean()        # mean keeps scale stable
+        loss  = ((model - spectra) ** 2).sum()        
+        # loss = residual_projected(params, x, spectra)  # projection keeps scale stable and improves convergence)
         loss.backward()
 
         with torch.no_grad():
@@ -1484,7 +1490,7 @@ def _fit_batch_adam(
                     torch.isfinite(clamped), clamped, p_r
                 ).reshape(B, npq)
             else:
-                params.data.clamp_(_LO, _HI)          # in-place, no allocation
+                params.data.clamp_(_lo, _hi)          # in-place, no allocation
 
         # Convergence check — .item() sync every 50 steps only
         if i % 50 == 0:
