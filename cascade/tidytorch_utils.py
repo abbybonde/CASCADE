@@ -587,20 +587,21 @@ def fit_with_bounded_adam(y, x, p0_stack, max_iter=1000, tol=1e-8):
 # Post-fit utilities
 # ---------------------------------------------------------------------------
 
-def prune_peaks(params: torch.Tensor, amp_threshold: float = 1e-3) -> torch.Tensor:
+def prune_peaks(params: torch.Tensor, wn: torch.Tensor, amp_threshold: float = 1e-3) -> torch.Tensor:
     """Zero out peaks whose amplitude is below threshold.
 
     Parameters
     ----------
     params        : (max_peaks * 4,) flat parameter vector
     amp_threshold : peaks with |amplitude| ≤ this value are zeroed
+    wn            : (n_pts,) wavenumber axis
 
     Returns
     -------
     (max_peaks * 4,) with sub-threshold peaks replaced by zeros
     """
     peaks     = params.reshape(-1, 4)
-    keep_mask = peaks[:, 0].abs() > amp_threshold
+    keep_mask = (peaks[:, 0].abs() > (amp_threshold))  & (peaks[:, 1] > wn.min()) & (peaks[:, 1] < wn.max())
     return (peaks * keep_mask.unsqueeze(1)).reshape(-1)
 
 
@@ -654,10 +655,10 @@ def deduplicate_peaks(params: torch.Tensor, min_spacing: float) -> torch.Tensor:
     return (peaks * (~suppress).unsqueeze(1)).reshape(-1)
 
 
-def _prune_peaks_batch(params_batch: torch.Tensor, amp_threshold: float = 1e-3) -> torch.Tensor:
+def _prune_peaks_batch(params_batch: torch.Tensor, amp_threshold: float = 1e-3, wn: torch.Tensor = None) -> torch.Tensor:
     """Batch version of prune_peaks for (B, n_params)."""
     peaks = params_batch.reshape(params_batch.shape[0], -1, 4)
-    keep_mask = peaks[:, :, 0].abs() > amp_threshold
+    keep_mask = (peaks[:, :, 0].abs() > (amp_threshold))  & (peaks[:, :, 1] > wn.min()) & (peaks[:, :, 1] < wn.max())
     return (peaks * keep_mask.unsqueeze(-1)).reshape_as(params_batch)
 
 
@@ -759,7 +760,7 @@ def process_pixel_fit(
     params, error, converged, n_iter = fit_with_bounded_adam(
         y=spectrum, x=x, p0_stack=p0, max_iter=max_iter, tol=tol
     )
-    params = prune_peaks(params, amp_threshold=1e-3)
+    params = prune_peaks(params, amp_threshold=1e-3, wn=x)
     params = deduplicate_peaks(params, min_spacing_post)
 
     if not is_valid:
@@ -790,6 +791,9 @@ def process_conv_deriv_fit(
     min_spacing_in: float = 0.0,
     min_spacing_post: float = 0.0,
     scale_preference_fraction: float = 0.8,
+    fixed_peaks: torch.Tensor = None,
+    sig: int = 5.0,
+    gam: int = 5.0,
 ) -> Tuple[torch.Tensor, bool, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Like process_pixel_fit, but runs derivative-based peak detection on the
@@ -881,12 +885,15 @@ def process_conv_deriv_fit(
         min_spacing=min_spacing_in,
         scale_preference_fraction=scale_preference_fraction,
     )
+    if fixed_peaks is not None:
+        p0 = add_fixed_peaks(peak_centers = fixed_peaks, x = x, y = spectrum, sig = sig, gam = gam, existing_params=p0)
 
+    
     # ---- 5. Fit ----------------------------------------------------------
     params, error, converged, n_iter = fit_with_bounded_adam(
         y=spectrum, x=x, p0_stack=p0, max_iter=max_iter, tol=tol
     )
-    params = prune_peaks(params, amp_threshold=amp_threshold)
+    params = prune_peaks(params, wn=x, amp_threshold=amp_threshold)
     params = deduplicate_peaks(params, min_spacing_post)
 
     if not is_valid:
@@ -2043,7 +2050,7 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
                              aggressive_lr_mult=aggressive_lr_mult,
                              aggressive_clip_norm=aggressive_clip_norm,
                              aggressive_beta1=aggressive_beta1).squeeze(0)
-    params = prune_peaks(params, amp_threshold=amp_threshold)
+    params = prune_peaks(params, amp_threshold=amp_threshold, wn=_x_dev)
     params = deduplicate_peaks(params, min_spacing)
 
     params_np = _cpu(params)
@@ -2092,327 +2099,115 @@ def _atomic_save(obj: dict, path: str) -> None:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
-# def run_batch_fit(
-#     spectra_np_batch: np.ndarray,
-#     samples=None,
-#     condition_labels=None,
-#     name: str = "run",
-#     batch_size: int = 500,
-#     max_iter: int = 5000,
-#     tol: float = 1e-5,
-#     amp_threshold: float = 1e-3,
-#     min_spacing_in: float = 7.0,
-#     min_spacing_post: float = 7.0,
-#     response_threshold: float = 0.001,
-#     min_scale_votes: int = 2,
-#     max_peaks: int = 200,
-#     scale_preference_fraction: float = 0.008,
-#     aggr_steps: int = 80,
-#     aggr_lr_mult: float = 4.0,
-#     aggr_clip: float = 3.0,
-#     aggr_beta1: float = 0.85,
-#     checkpoint_every: int = 5000,
-#     fit_checkpoint_every: int = 250,
-#     resume: bool = False,
-#     save_results: bool = True,
-# ) -> dict:
-#     """Run the full batch fitting pipeline on a pre-generated spectra array.
 
-#     Requires ``init_sweep_context()`` to have been called first to set up GPU
-#     tensors and wavelet banks.
 
-#     Parameters
-#     ----------
-#     spectra_np_batch : (N, n_pts) float32 numpy array of raw spectra
-#     samples          : list of SampleWrapper objects for peak matching; None skips
-#     condition_labels : list of (noise, sep) tuples used in checkpoint payloads
-#     name             : run identifier used in checkpoint and output filenames
-#     batch_size       : number of spectra per GPU batch
-#     max_iter         : Adam optimiser iteration budget
-#     tol              : convergence tolerance
-#     amp_threshold    : post-fit amplitude pruning threshold
-#     min_spacing_in   : minimum peak spacing for initial guess construction (px)
-#     min_spacing_post : minimum peak spacing for post-fit deduplication (px)
-#     response_threshold : minimum wavelet response to retain a peak candidate
-#     min_scale_votes  : minimum cross-scale votes to retain a candidate
-#     max_peaks        : maximum peaks per spectrum
-#     scale_preference_fraction : wavelet scale preference bias (lower → finer)
-#     aggr_steps       : aggressive Adam burst steps at the start
-#     aggr_lr_mult     : LR multiplier during the aggressive phase
-#     aggr_clip        : gradient clip norm during the aggressive phase
-#     aggr_beta1       : Adam beta1 during the aggressive phase
-#     checkpoint_every : p0-build progress print cadence (spectra)
-#     fit_checkpoint_every : Adam progress print cadence (iterations)
-#     resume           : load from an existing checkpoint before running
-#     save_results     : save final results dict to ``synthetic_fit_{name}.pt``
+def add_fixed_peaks(
+    peak_centers: list[float],
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sig: float = 1.0,
+    gam: float = 1.0,
+    existing_params: list[float] | None = None,
+    priority_window: float = 2.0,
+) -> torch.Tensor:
+    """
+    Build a 1-D tensor [amp, ctr, sig, gam, ...] for a set of peaks.
 
-#     Returns
-#     -------
-#     dict with keys: params_all, model_all, spectra_np, spec_d,
-#                     condition_labels, x_axis, f1_vals, prec_vals, rec_vals,
-#                     all_stats
-#     """
-#     if spectra_np_batch.ndim != 2:
-#         raise ValueError(f"Expected (N, n_pts), got {spectra_np_batch.shape}")
+    Parameters
+    ----------
+    peak_centers : list of float
+        Candidate peak center positions.
+    x, y : torch.Tensor (1-D)
+        Spectrum; amplitude is linearly interpolated from y at each center.
+    sig, gam : float
+        Shared sigma / gamma stamped onto every new peak.
+    existing_params : list of float, optional
+        Flat [amp, ctr, sig, gam, ...] from a previous fit. Existing centers
+        within *priority_window* of a candidate supersede that candidate.
+    priority_window : float
+        Distance threshold for existing-peak priority.
 
-#     N_TOTAL, N_PTS = spectra_np_batch.shape
-#     target_cols = max_peaks * 4
-#     x_np = _ctx_x.copy()
-#     checkpoint_path = f"ckpt_fit_{name}.pt"
+    Returns
+    -------
+    torch.Tensor, shape (N*4,), dtype matches x/y
+    """
 
-#     params_all = np.zeros((N_TOTAL, target_cols), dtype=np.float32)
-#     model_all  = np.zeros((N_TOTAL, N_PTS),       dtype=np.float32)
-#     spec_d_all = np.zeros((N_TOTAL, N_PTS),       dtype=np.float32)
-#     all_stats  = [None] * N_TOTAL
+    def interp(x_query: float) -> torch.Tensor:
+        """Linear interpolation of y at scalar x_query."""
+        idx = torch.searchsorted(x, torch.tensor(x_query, dtype=x.dtype))
+        idx = idx.clamp(1, x.shape[0] - 1)
+        x0, x1 = x[idx - 1], x[idx]
+        y0, y1 = y[idx - 1], y[idx]
+        t = (torch.tensor(x_query, dtype=x.dtype) - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
 
-#     resume_from = 0
-#     if resume:
-#         if not os.path.exists(checkpoint_path):
-#             raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
-#         _ckpt = torch.load(checkpoint_path, weights_only=False)
-#         resume_from = int(_ckpt["batches_completed"])
-#         params_all[:resume_from] = _ckpt["params_all"]
-#         model_all[:resume_from]  = _ckpt["model_all"]
-#         spec_d_all[:resume_from] = _ckpt["spec_d"]
-#         all_stats[:resume_from]  = _ckpt["all_stats"]
-#         print(f"Resumed from {checkpoint_path}: {resume_from}/{N_TOTAL} spectra")
+    # ------------------------------------------------------------------ #
+    # 1. Parse existing peaks                                              #
+    # ------------------------------------------------------------------ #
+    existing_peaks: list[dict] = []
+    if existing_params is not None and existing_params.numel() > 0:
+        if len(existing_params) % 4 != 0:
+            raise ValueError("existing_params length must be a multiple of 4.")
+        for i in range(0, len(existing_params), 4):
+            existing_peaks.append({
+                "amp": existing_params[i],
+                "ctr": existing_params[i + 1],
+                "sig": existing_params[i + 2],
+                "gam": existing_params[i + 3],
+            })
 
-#     _sync_device(_ctx_device)
-#     t_init = time.perf_counter()
-#     batch_total_times, batch_fit_times, tbp, tfp, p_fit = [], [], [], [], []
+    existing_ctrs = torch.tensor(
+        [p["ctr"] for p in existing_peaks], dtype=x.dtype
+    ) if existing_peaks else torch.tensor([], dtype=x.dtype)
 
-#     with torch.no_grad():
-#         if _ctx_device.type == "cuda":
-#             torch.cuda.empty_cache()
-#     try:
-#         for start in range(resume_from, N_TOTAL, batch_size):
-#             end = min(start + batch_size, N_TOTAL)
-#             spec_np = spectra_np_batch[start:end]
-#             B = spec_np.shape[0]
-#             print(f"\n[batch {start}:{end}] spectra: {B} x {spec_np.shape[1]}")
+    # ------------------------------------------------------------------ #
+    # 2. Resolve candidates vs. existing peaks                            #
+    # ------------------------------------------------------------------ #
+    claimed_existing: set[int] = set()
+    resolved: list[dict] = []
 
-#             spectra_gpu = torch.as_tensor(spec_np, dtype=torch.float32, device=_ctx_device)
+    for ctr in peak_centers:
+        if existing_ctrs.numel() > 0:
+            dists = (existing_ctrs - ctr).abs()
+            nearest_idx = int(dists.argmin())
+            nearest_dist = float(dists[nearest_idx])
+        else:
+            nearest_idx, nearest_dist = -1, float("inf")
 
-#             with torch.no_grad():
-#                 _ = _denoise_batch(spectra_gpu[:1])
+        if nearest_dist <= priority_window and nearest_idx not in claimed_existing:
+            claimed_existing.add(nearest_idx)
+            resolved.append(existing_peaks[nearest_idx])
+        else:
+            resolved.append({
+                "amp": interp(ctr),
+                "ctr": float(ctr),
+                "sig": sig,
+                "gam": gam,
+            })
 
-#             _sync_device(_ctx_device)
-#             t0 = time.perf_counter()
+    # ------------------------------------------------------------------ #
+    # 3. Keep unmatched existing peaks                                     #
+    # ------------------------------------------------------------------ #
+    for idx, ep in enumerate(existing_peaks):
+        if idx not in claimed_existing:
+            resolved.append(ep)
 
-#             # 1) Denoise + Lor4 transform + cross-scale voting
-#             spec_d = _denoise_batch(spectra_gpu)
-#             resp = _lor4_transform_batch(spec_d)
-#             _, n_widths, n_pts = resp.shape
+    # ------------------------------------------------------------------ #
+    # 4. Flatten to [amp, ctr, sig, gam, ...]                             #
+    # ------------------------------------------------------------------ #
+    parts = []
+    for peak in resolved:
+        amp = peak["amp"] if isinstance(peak["amp"], torch.Tensor) else torch.tensor(peak["amp"], dtype=x.dtype)
+        parts.extend([
+            amp,
+            torch.tensor(peak["ctr"], dtype=x.dtype),
+            torch.tensor(peak["sig"], dtype=x.dtype),
+            torch.tensor(peak["gam"], dtype=x.dtype),
+        ])
 
-#             flat_masks = find_peaks_derivative_mask_batch(
-#                 _x_dev, resp.reshape(B * n_widths, n_pts), min_height=0.0
-#             )
-#             masks = flat_masks.reshape(B, n_widths, n_pts)
-#             vote_count = masks.long().sum(dim=1)
-#             max_resp = resp.max(dim=1).values
-#             peak_masks = (vote_count >= min_scale_votes) & (max_resp > response_threshold)
+    return torch.stack(parts)
 
-#             # 2) Build padded p0 + gradient mask (per-spectrum loop, unavoidable)
-#             npq = max_peaks * 4
-#             p0_flat_list = []
-#             n_real_peaks = []
 
-#             t_init0 = time.perf_counter()
-#             for i in range(B):
-#                 p0 = build_initial_guesses_from_derivative_mask(
-#                     resp[i].unsqueeze(1),
-#                     _ctx_sigmas.to(_ctx_device),
-#                     _ctx_gammas[:1].to(_ctx_device),
-#                     _x_dev,
-#                     spec_d[i],
-#                     peak_masks[i],
-#                     max_peaks=max_peaks,
-#                     min_spacing=min_spacing_in,
-#                     scale_preference_fraction=scale_preference_fraction,
-#                 )
-#                 p0_flat = p0[:npq]
-#                 p0_flat_list.append(p0_flat)
-#                 n_real_peaks.append(min(int((p0_flat[0::4] > 0).sum().item()), max_peaks))
-
-#                 done = i + 1
-#                 if (done % checkpoint_every == 0) or (done == B):
-#                     elapsed = time.perf_counter() - t_init0
-#                     rate = done / max(elapsed, 1e-9)
-#                     eta = (B - done) / max(rate, 1e-9)
-#                     print(
-#                         f"[checkpoint] initialized {done}/{B} "
-#                         f"({100.0*done/B:.1f}%) | elapsed {elapsed:.1f}s | ETA {eta:.1f}s"
-#                     )
-
-#             p0_batch  = torch.zeros(B, npq, device=_ctx_device)
-#             grad_mask = torch.zeros(B, npq, dtype=torch.float32, device=_ctx_device)
-#             for i, (p0_flat, n_pk) in enumerate(zip(p0_flat_list, n_real_peaks)):
-#                 n_take = min(p0_flat.numel(), npq)
-#                 p0_batch[i, :n_take] = p0_flat[:n_take]
-#                 grad_mask[i, : min(n_pk * 4, npq)] = 1.0
-
-#             # 3) Batched Adam fit
-#             _sync_device(_ctx_device)
-#             t_fit0 = time.perf_counter()
-#             params_fit = _fit_batch_adam(
-#                 spec_d, _x_dev, p0_batch, grad_mask,
-#                 max_iter=max_iter, tol=tol,
-#                 aggressive_start_steps=aggr_steps,
-#                 aggressive_lr_mult=aggr_lr_mult,
-#                 aggressive_clip_norm=aggr_clip,
-#                 aggressive_beta1=aggr_beta1,
-#                 progress_every=fit_checkpoint_every,
-#                 progress_prefix="fit",
-#             )
-#             _sync_device(_ctx_device)
-#             fit_only_sec = time.perf_counter() - t_fit0
-
-#             # 4) Post-process: prune + deduplicate
-#             params_pruned = _prune_peaks_batch(params_fit, amp_threshold=amp_threshold)
-#             params_pruned = _deduplicate_peaks_batch(params_pruned, min_spacing_post)
-
-#             cur_cols = params_pruned.shape[1]
-#             if cur_cols < target_cols:
-#                 pad = torch.zeros(B, target_cols - cur_cols,
-#                                 dtype=params_pruned.dtype, device=params_pruned.device)
-#                 params_pruned = torch.cat([params_pruned, pad], dim=1)
-#             elif cur_cols > target_cols:
-#                 params_pruned = params_pruned[:, :target_cols]
-
-#             params_all[start:end] = params_pruned.cpu().numpy().astype(np.float32)
-
-#             # 5) Recover model from original (unpruned) fitted params
-#             with torch.no_grad():
-#                 model_all[start:end] = _compute_model_batch(params_fit, _x_dev).cpu().numpy().astype(np.float32)
-
-#             spec_d_all[start:end] = spec_d.cpu().numpy().astype(np.float32)
-
-#             _sync_device(_ctx_device)
-#             total_sec = time.perf_counter() - t0
-
-#             n_fit_peaks = (params_fit.reshape(B, -1, 4)[:, :, 0] > amp_threshold).sum(dim=1)
-#             print(f"\nBatch fit summary:")
-#             print(f"  total  : {total_sec:.3f}s  ({total_sec/B:.4f}s/spectrum)")
-#             print(f"  fit    : {fit_only_sec:.3f}s  ({fit_only_sec/B:.4f}s/spectrum)")
-#             print(
-#                 f"  peaks  : mean={n_fit_peaks.float().mean().item():.1f}  "
-#                 f"median={n_fit_peaks.float().median().item():.1f}"
-#             )
-
-#             batch_total_times.append(total_sec)
-#             batch_fit_times.append(fit_only_sec)
-#             tbp.append(total_sec / B)
-#             tfp.append(fit_only_sec / B)
-#             p_fit.append(n_fit_peaks.float().mean().item())
-
-#             # 6) Peak matching against ground-truth (skipped if no samples provided)
-#             if samples is not None:
-#                 for i_global in range(start, end):
-#                     s = samples[i_global]
-#                     all_stats[i_global] = _match_peaks(
-#                         s.centers, s.amplitudes, s.sigmas, s.gammas,
-#                         params_all[i_global],
-#                         tolerance=min_spacing_in,
-#                         amp_threshold=amp_threshold,
-#                         x_arr=x_np,
-#                     )
-
-#             # 7) Incremental checkpoint
-#             completed = all_stats[:end]
-#             valid_stats = [s for s in completed if s is not None]
-#             f1_so_far   = np.asarray([s["f1"]        for s in valid_stats], dtype=np.float64)
-#             prec_so_far = np.asarray([s["precision"] for s in valid_stats], dtype=np.float64)
-#             rec_so_far  = np.asarray([s["recall"]    for s in valid_stats], dtype=np.float64)
-#             _atomic_save({
-#                 "params_all":        params_all[:end],
-#                 "model_all":         model_all[:end],
-#                 "spectra_np":        spectra_np_batch[:end].astype(np.float32),
-#                 "spec_d":            spec_d_all[:end],
-#                 "condition_labels":  condition_labels[:end] if condition_labels is not None else None,
-#                 "x_axis":            x_np,
-#                 "f1_vals":           f1_so_far,
-#                 "prec_vals":         prec_so_far,
-#                 "rec_vals":          rec_so_far,
-#                 "all_stats":         completed,
-#                 "batches_completed": end,
-#                 "n_total":           N_TOTAL,
-#             }, checkpoint_path)
-#             print(f"  [checkpoint saved: {end}/{N_TOTAL} → {checkpoint_path}]")
-
-#             del params_fit, params_pruned, p0_batch, flat_masks, masks, resp
-#             del spectra_gpu, spec_d, grad_mask, peak_masks, vote_count
-#             del p0_flat_list, n_real_peaks
-#             torch.cuda.empty_cache()   # <-- add this
-#     except KeyboardInterrupt:
-#         print("\nInterrupted — saving checkpoint before exiting...")
-#         _atomic_save({
-#             "params_all":        params_all[:start],
-#             "model_all":         model_all[:start],
-#             "spectra_np":        spectra_np_batch[:start].astype(np.float32),
-#             "spec_d":            spec_d_all[:start],
-#             "condition_labels":  condition_labels[:start] if condition_labels is not None else None,
-#             "x_axis":            x_np,
-#             "f1_vals":           np.array([]),
-#             "prec_vals":         np.array([]),
-#             "rec_vals":          np.array([]),
-#             "all_stats":         all_stats[:start],
-#             "batches_completed": start,
-#             "n_total":           N_TOTAL,
-#         }, checkpoint_path)
-#         print(f"Checkpoint saved at {start}/{N_TOTAL}. Re-run with resume=True.")
-#         return {
-#             "params_all": params_all,
-#             "model_all":  model_all,
-#             # "spectra_np": spectra_np_batch.astype(np.float32),
-#             "spec_d":     spec_d_all,
-#             "condition_labels": condition_labels,
-#             "x_axis":     x_np,
-#             "f1_vals":    np.array([]),
-#             "prec_vals":  np.array([]),
-#             "rec_vals":   np.array([]),
-#             "all_stats":  all_stats,
-#         }
-#     finally:
-#         # Always clean up GPU memory
-#         torch.cuda.empty_cache()
-#         torch.cuda.synchronize()
-
-#     _sync_device(_ctx_device)
-#     t_final = time.perf_counter()
-
-#     valid_stats = [s for s in all_stats if s is not None]
-#     f1_vals   = np.asarray([s["f1"]        for s in valid_stats], dtype=np.float64)
-#     prec_vals = np.asarray([s["precision"] for s in valid_stats], dtype=np.float64)
-#     rec_vals  = np.asarray([s["recall"]    for s in valid_stats], dtype=np.float64)
-
-#     print(f"\nCompleted {N_TOTAL} spectra in {t_final - t_init:.3f}s")
-#     if len(f1_vals) > 0:
-#         print(f"Peak matching:  F1={f1_vals.mean():.3f}  P={prec_vals.mean():.3f}  R={rec_vals.mean():.3f}")
-#     print(
-#         f"Timing:  {np.mean(tbp):.4f}s/spectrum total  "
-#         f"({np.mean(tfp):.4f}s/spectrum fit)  "
-#         f"{np.mean(p_fit):.1f} peaks/spectrum avg"
-#     )
-
-#     results = {
-#         "params_all":       params_all,
-#         "model_all":        model_all,
-#         # "spectra_np":       spectra_np_batch.astype(np.float32),
-#         "spec_d":           spec_d_all,
-#         "condition_labels": condition_labels,
-#         "x_axis":           x_np,
-#         "f1_vals":          f1_vals,
-#         "prec_vals":        prec_vals,
-#         "rec_vals":         rec_vals,
-#         "all_stats":        all_stats,
-#     }
-
-#     if save_results:
-#         out_path = f"fit_{name}.pt"
-#         torch.save(results, out_path)
-#         print(f"Saved: {out_path}")
-
-#     return results
 
 def run_batch_fit(
     spectra_np_batch: np.ndarray,
@@ -2437,6 +2232,9 @@ def run_batch_fit(
     fit_checkpoint_every: int = 250,
     resume: bool = False,
     save_results: bool = True,
+    fixed_peaks: list[float] | None = None,
+    sig: float = 5.0,
+    gam: float = 5.0,
 ) -> dict:
     """Run the full batch fitting pipeline on a pre-generated spectra array.
 
@@ -2568,7 +2366,13 @@ def run_batch_fit(
                     scale_preference_fraction=scale_preference_fraction,
                 )
                 p0_flat = p0[:npq]
-                p0_flat_list.append(p0_flat)
+                if fixed_peaks is not None:
+                    p0_plus = add_fixed_peaks(peak_centers = fixed_peaks, x = _x_dev, y = spec_d[i], sig = sig, gam = gam, existing_params=p0_flat[:npq])
+                    p0_flat_list.append(p0_plus)
+                
+                elif fixed_peaks is None:
+                    p0_flat_list.append(p0_flat)
+
                 n_real_peaks.append(min(int((p0_flat[0::4] > 0).sum().item()), max_peaks))
 
                 done = i + 1
@@ -2605,7 +2409,7 @@ def run_batch_fit(
             fit_only_sec = time.perf_counter() - t_fit0
 
             # 4) Post-process: prune + deduplicate
-            params_pruned = _prune_peaks_batch(params_fit, amp_threshold=amp_threshold)
+            params_pruned = _prune_peaks_batch(params_fit, amp_threshold=amp_threshold, wn=_x_dev)
             params_pruned = _deduplicate_peaks_batch(params_pruned, min_spacing_post)
 
             cur_cols = params_pruned.shape[1]

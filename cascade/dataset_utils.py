@@ -245,11 +245,11 @@ def save_h5_file(
             lazy5.alter.write_attr_dict(dset=dset_name, attr_dict=attrs, fid=fid)
 
     # Save datasets
-    _save_dataset('preprocessed_images/raw', raw_data, dtype=np.uint16)
-    _save_dataset('preprocessed_images/nrb', nrb, dtype=np.uint16)
-    _save_dataset('preprocessed_images/dark', dark, dtype=np.uint16)
+    _save_dataset('preprocessed_images/raw', raw_data, dtype=np.float32)
+    _save_dataset('preprocessed_images/nrb', nrb, dtype=np.float32)
+    _save_dataset('preprocessed_images/dark', dark, dtype=np.float32)
     _save_dataset('preprocessed_images/model', model, dtype=np.float32)
-    _save_dataset('preprocessed_images/peak_params', peak_params)   # keep native dtype unless you want otherwise
+    _save_dataset('preprocessed_images/peak_params', peak_params, dtype=np.float32)   # keep native dtype unless you want otherwise
     _save_dataset('preprocessed_images/x_axis', x_axis, dtype=np.float32)
 
 def voigt_peak(x, center, amp, sigma, gamma=5.0, Real=False):

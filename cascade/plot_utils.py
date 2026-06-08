@@ -98,7 +98,7 @@ class HandlerRainbowLine(HandlerBase):
         return lines
 
         
-def plot_voigt_fit_res(x, y_true, params, peaks_dict=None, title=None):
+def plot_voigt_fit_res(x, y_true, params, peaks_dict=None, title=None, fixed_peaks=None, priority_window=2):
     """Plot a Voigt peak decomposition with a residual panel.
 
     Draws:
@@ -115,6 +115,7 @@ def plot_voigt_fit_res(x, y_true, params, peaks_dict=None, title=None):
     params    : (n_peaks * 4,) flat parameter vector [amp, ctr, sig, gam, ...]
     peaks_dict: unused; kept for API compatibility
     title     : figure title string
+    fixed_peaks: list of fixed peak positions
     """
     plt.rcParams.update({
         "font.family": "serif",
@@ -158,6 +159,30 @@ def plot_voigt_fit_res(x, y_true, params, peaks_dict=None, title=None):
     for i, yp in enumerate(y_peaks):
         ax1.plot(x, yp, alpha=1, lw=0.5)
     
+# Highlight fixed peaks
+    if fixed_peaks is not None:
+        peaks_matrix = params.reshape(-1, 4)
+        ctrs = peaks_matrix[:, 1]
+        for peak in fixed_peaks:
+            dists = np.abs(ctrs - peak)
+            nearest_idx = dists.argmin()
+            nearest_ctr = ctrs[nearest_idx].item()
+            if dists[nearest_idx].item() <= priority_window:
+                label_ctr = nearest_ctr
+            else:
+                label_ctr = peak
+            ax1.plot(
+                    [label_ctr, label_ctr], [0, ax1.get_ylim()[1] * 0.95],
+                    color='teal', alpha= 0.5, linestyle=':', lw=2
+                            )
+            ax1.text(
+                label_ctr,  0.95,
+                f"{label_ctr:.1f}",
+                color='teal', alpha = 0.8, fontsize=8,
+                rotation=90, va='top', ha='right',
+                transform=ax1.get_xaxis_transform(),  # x in data coords, y in axes coords (0–1)
+
+            )
     # Calculate fit quality
     rmse = np.sqrt(np.mean(residual**2))
     r2 = 1 - np.sum(residual**2) / np.sum((y_true - np.mean(y_true))**2)
