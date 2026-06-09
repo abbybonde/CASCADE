@@ -794,6 +794,7 @@ def process_conv_deriv_fit(
     fixed_peaks: torch.Tensor = None,
     sig: int = 5.0,
     gam: int = 5.0,
+    suppression_windows: list[float] = None,
 ) -> Tuple[torch.Tensor, bool, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Like process_pixel_fit, but runs derivative-based peak detection on the
@@ -886,7 +887,7 @@ def process_conv_deriv_fit(
         scale_preference_fraction=scale_preference_fraction,
     )
     if fixed_peaks is not None:
-        p0 = add_fixed_peaks(peak_centers = fixed_peaks, x = x, y = spectrum, sig = sig, gam = gam, existing_params=p0)
+        p0 = add_fixed_peaks(peak_centers = fixed_peaks, x = x, y = spectrum, sig = sig, gam = gam, existing_params=p0, suppression_windows = suppression_windows)
 
     
     # ---- 5. Fit ----------------------------------------------------------
@@ -2101,6 +2102,115 @@ def _atomic_save(obj: dict, path: str) -> None:
         raise
 
 
+# def add_fixed_peaks(
+#     peak_centers: list[float],
+#     x: torch.Tensor,
+#     y: torch.Tensor,
+#     sig: float = 1.0,
+#     gam: float = 1.0,
+#     existing_params: list[float] | None = None,
+#     priority_window: float = 2.0,
+# ) -> torch.Tensor:
+#     """
+#     Build a 1-D tensor [amp, ctr, sig, gam, ...] for a set of peaks.
+
+#     Parameters
+#     ----------
+#     peak_centers : list of float
+#         Candidate peak center positions.
+#     x, y : torch.Tensor (1-D)
+#         Spectrum; amplitude is linearly interpolated from y at each center.
+#     sig, gam : float
+#         Shared sigma / gamma stamped onto every new peak.
+#     existing_params : list of float, optional
+#         Flat [amp, ctr, sig, gam, ...] from a previous fit. Existing centers
+#         within *priority_window* of a candidate supersede that candidate.
+#     priority_window : float
+#         Distance threshold for existing-peak priority.
+
+#     Returns
+#     -------
+#     torch.Tensor, shape (N*4,), dtype matches x/y
+#     """
+
+#     def interp(x_query: float) -> torch.Tensor:
+#         """Linear interpolation of y at scalar x_query."""
+#         idx = torch.searchsorted(x, torch.tensor(x_query, dtype=x.dtype))
+#         idx = idx.clamp(1, x.shape[0] - 1)
+#         x0, x1 = x[idx - 1], x[idx]
+#         y0, y1 = y[idx - 1], y[idx]
+#         t = (torch.tensor(x_query, dtype=x.dtype) - x0) / (x1 - x0)
+#         return y0 + t * (y1 - y0)
+
+#     # ------------------------------------------------------------------ #
+#     # 1. Parse existing peaks                                              #
+#     # ------------------------------------------------------------------ #
+#     existing_peaks: list[dict] = []
+#     if existing_params is not None and existing_params.numel() > 0:
+#         if len(existing_params) % 4 != 0:
+#             raise ValueError("existing_params length must be a multiple of 4.")
+#         for i in range(0, len(existing_params), 4):
+#             existing_peaks.append({
+#                 "amp": existing_params[i],
+#                 "ctr": existing_params[i + 1],
+#                 "sig": existing_params[i + 2],
+#                 "gam": existing_params[i + 3],
+#             })
+
+#     existing_ctrs = torch.tensor(
+#         [p["ctr"] for p in existing_peaks], dtype=x.dtype
+#     ) if existing_peaks else torch.tensor([], dtype=x.dtype)
+
+#     # ------------------------------------------------------------------ #
+#     # 2. Resolve candidates vs. existing peaks                            #
+#     # ------------------------------------------------------------------ #
+#     claimed_existing: set[int] = set()
+#     resolved: list[dict] = []
+
+#     for ctr in peak_centers:
+#         if existing_ctrs.numel() > 0:
+#             dists = (existing_ctrs - ctr).abs()
+#             nearest_idx = int(dists.argmin())
+#             nearest_dist = float(dists[nearest_idx])
+#         else:
+#             nearest_idx, nearest_dist = -1, float("inf")
+
+#         if nearest_dist <= priority_window and nearest_idx not in claimed_existing:
+#                     claimed_existing.add(nearest_idx)
+#                     matched = dict(existing_peaks[nearest_idx])  # shallow copy
+#                     matched["ctr"] = float(ctr)                  # override center
+#                     resolved.append(matched)
+#         else:
+#             resolved.append({
+#                 "amp": interp(ctr)*0.75,
+#                 "ctr": float(ctr),
+#                 "sig": sig,
+#                 "gam": gam,
+#             })
+
+#     # ------------------------------------------------------------------ #
+#     # 3. Keep unmatched existing peaks                                     #
+#     # ------------------------------------------------------------------ #
+#     for idx, ep in enumerate(existing_peaks):
+#         if idx not in claimed_existing:
+#             resolved.append(ep)
+
+#     # ------------------------------------------------------------------ #
+#     # 4. Flatten to [amp, ctr, sig, gam, ...]                             #
+#     # ------------------------------------------------------------------ #
+#     parts = []
+#     for peak in resolved:
+#         amp = peak["amp"] if isinstance(peak["amp"], torch.Tensor) else torch.tensor(peak["amp"], dtype=x.dtype)
+#         parts.extend([
+#             amp,
+#             torch.tensor(peak["ctr"], dtype=x.dtype),
+#             torch.tensor(peak["sig"], dtype=x.dtype),
+#             torch.tensor(peak["gam"], dtype=x.dtype),
+#         ])
+
+#     return torch.stack(parts)
+
+
 def add_fixed_peaks(
     peak_centers: list[float],
     x: torch.Tensor,
@@ -2109,6 +2219,7 @@ def add_fixed_peaks(
     gam: float = 1.0,
     existing_params: list[float] | None = None,
     priority_window: float = 2.0,
+    suppression_windows: list[float] | None = None,
 ) -> torch.Tensor:
     """
     Build a 1-D tensor [amp, ctr, sig, gam, ...] for a set of peaks.
@@ -2125,7 +2236,12 @@ def add_fixed_peaks(
         Flat [amp, ctr, sig, gam, ...] from a previous fit. Existing centers
         within *priority_window* of a candidate supersede that candidate.
     priority_window : float
-        Distance threshold for existing-peak priority.
+        Distance threshold for center-snapping to fixed peak positions.
+    suppression_windows : list of float, optional
+        Per-fixed-peak window size. Existing peaks whose centers fall within
+        this distance of a fixed peak are absorbed into it (amp summed,
+        sig/gam amplitude-weighted averaged) and removed from the output.
+        Must be the same length as peak_centers if provided.
 
     Returns
     -------
@@ -2133,7 +2249,6 @@ def add_fixed_peaks(
     """
 
     def interp(x_query: float) -> torch.Tensor:
-        """Linear interpolation of y at scalar x_query."""
         idx = torch.searchsorted(x, torch.tensor(x_query, dtype=x.dtype))
         idx = idx.clamp(1, x.shape[0] - 1)
         x0, x1 = x[idx - 1], x[idx]
@@ -2142,7 +2257,15 @@ def add_fixed_peaks(
         return y0 + t * (y1 - y0)
 
     # ------------------------------------------------------------------ #
-    # 1. Parse existing peaks                                              #
+    # 0. Validate / default suppression windows                           #
+    # ------------------------------------------------------------------ #
+    if suppression_windows is None:
+        suppression_windows = [0.0] * len(peak_centers)
+    if len(suppression_windows) != len(peak_centers):
+        raise ValueError("suppression_windows must have the same length as peak_centers.")
+
+    # ------------------------------------------------------------------ #
+    # 1. Parse existing peaks                                             #
     # ------------------------------------------------------------------ #
     existing_peaks: list[dict] = []
     if existing_params is not None and existing_params.numel() > 0:
@@ -2157,56 +2280,114 @@ def add_fixed_peaks(
             })
 
     existing_ctrs = torch.tensor(
-        [p["ctr"] for p in existing_peaks], dtype=x.dtype
+        [float(p["ctr"]) for p in existing_peaks], dtype=x.dtype
     ) if existing_peaks else torch.tensor([], dtype=x.dtype)
 
     # ------------------------------------------------------------------ #
-    # 2. Resolve candidates vs. existing peaks                            #
+    # 2. Assign each existing peak to nearest fixed peak within its       #
+    #    suppression window (nearest fixed peak wins on ties)             #
+    # ------------------------------------------------------------------ #
+    fixed_ctrs = torch.tensor(peak_centers, dtype=x.dtype)
+    suppressed_by: dict[int, int] = {}  # existing_idx -> fixed_idx
+
+    if existing_peaks and fixed_ctrs.numel() > 0:
+        for ei, ep in enumerate(existing_peaks):
+            ec = float(ep["ctr"])
+            dists = (fixed_ctrs - ec).abs()
+            nearest_fi = int(dists.argmin())
+            nearest_dist = float(dists[nearest_fi])
+            sw = suppression_windows[nearest_fi]
+            if sw > 0.0 and nearest_dist <= sw:
+                suppressed_by[ei] = nearest_fi
+
+    # ------------------------------------------------------------------ #
+    # 3. Resolve candidates vs. existing peaks (center-snapping)          #
     # ------------------------------------------------------------------ #
     claimed_existing: set[int] = set()
     resolved: list[dict] = []
 
-    for ctr in peak_centers:
-        if existing_ctrs.numel() > 0:
-            dists = (existing_ctrs - ctr).abs()
-            nearest_idx = int(dists.argmin())
-            nearest_dist = float(dists[nearest_idx])
-        else:
-            nearest_idx, nearest_dist = -1, float("inf")
+    for fi, ctr in enumerate(peak_centers):
+        sw = suppression_windows[fi]
 
-        if nearest_dist <= priority_window and nearest_idx not in claimed_existing:
-            claimed_existing.add(nearest_idx)
-            resolved.append(existing_peaks[nearest_idx])
+        # Collect all existing peaks suppressed by this fixed peak
+        absorbed_idxs = [ei for ei, fj in suppressed_by.items() if fj == fi]
+        absorbed = [existing_peaks[ei] for ei in absorbed_idxs]
+        claimed_existing.update(absorbed_idxs)
+
+        # Check for a center-snap candidate (within priority_window,
+        # not already claimed, not being suppressed)
+        snap_idx, snap_dist = -1, float("inf")
+        if existing_ctrs.numel() > 0:
+            for ei in range(len(existing_peaks)):
+                if ei in claimed_existing:
+                    continue
+                d = abs(float(existing_ctrs[ei]) - ctr)
+                if d <= priority_window and d < snap_dist:
+                    snap_dist = d
+                    snap_idx = ei
+
+        if snap_idx >= 0:
+            claimed_existing.add(snap_idx)
+            snap_peak = existing_peaks[snap_idx]
+            # Include the snapped peak in the absorption pool for blending
+            all_absorbed = absorbed + [snap_peak]
         else:
-            resolved.append({
-                "amp": interp(ctr),
-                "ctr": float(ctr),
-                "sig": sig,
-                "gam": gam,
-            })
+            # No existing peak to snap to; seed with interpolated amp, default sig/gam
+            seed = {"amp": interp(ctr), "ctr": float(ctr), "sig": sig, "gam": gam}
+            all_absorbed = absorbed + [seed]
+
+        # ------------------------------------------------------------------ #
+        # Blend absorbed peaks: sum amp, amplitude-weighted mean sig/gam      #
+        # ------------------------------------------------------------------ #
+        amps = torch.stack([
+            p["amp"] if isinstance(p["amp"], torch.Tensor)
+            else torch.tensor(float(p["amp"]), dtype=x.dtype)
+            for p in all_absorbed
+        ])
+        sigs = torch.stack([
+            p["sig"] if isinstance(p["sig"], torch.Tensor)
+            else torch.tensor(float(p["sig"]), dtype=x.dtype)
+            for p in all_absorbed
+        ])
+        gams = torch.stack([
+            p["gam"] if isinstance(p["gam"], torch.Tensor)
+            else torch.tensor(float(p["gam"]), dtype=x.dtype)
+            for p in all_absorbed
+        ])
+
+        total_amp = amps.sum()
+        weights = amps / (total_amp + 1e-12)
+        blended_sig = (weights * sigs).sum()
+        blended_gam = (weights * gams).sum()
+
+        resolved.append({
+            "amp": total_amp,
+            "ctr": float(ctr),  # always use fixed peak center
+            "sig": blended_sig,
+            "gam": blended_gam,
+        })
 
     # ------------------------------------------------------------------ #
-    # 3. Keep unmatched existing peaks                                     #
+    # 4. Keep unmatched, unsuppressed existing peaks                      #
     # ------------------------------------------------------------------ #
     for idx, ep in enumerate(existing_peaks):
         if idx not in claimed_existing:
             resolved.append(ep)
 
     # ------------------------------------------------------------------ #
-    # 4. Flatten to [amp, ctr, sig, gam, ...]                             #
+    # 5. Flatten to [amp, ctr, sig, gam, ...]                             #
     # ------------------------------------------------------------------ #
     parts = []
     for peak in resolved:
-        amp = peak["amp"] if isinstance(peak["amp"], torch.Tensor) else torch.tensor(peak["amp"], dtype=x.dtype)
+        amp = peak["amp"] if isinstance(peak["amp"], torch.Tensor) else torch.tensor(float(peak["amp"]), dtype=x.dtype)
         parts.extend([
             amp,
-            torch.tensor(peak["ctr"], dtype=x.dtype),
-            torch.tensor(peak["sig"], dtype=x.dtype),
-            torch.tensor(peak["gam"], dtype=x.dtype),
+            torch.tensor(float(peak["ctr"]), dtype=x.dtype),
+            peak["sig"] if isinstance(peak["sig"], torch.Tensor) else torch.tensor(float(peak["sig"]), dtype=x.dtype),
+            peak["gam"] if isinstance(peak["gam"], torch.Tensor) else torch.tensor(float(peak["gam"]), dtype=x.dtype),
         ])
 
     return torch.stack(parts)
-
 
 
 def run_batch_fit(
@@ -2235,6 +2416,7 @@ def run_batch_fit(
     fixed_peaks: list[float] | None = None,
     sig: float = 5.0,
     gam: float = 5.0,
+    suppression_windows: list[float] | None = None,
 ) -> dict:
     """Run the full batch fitting pipeline on a pre-generated spectra array.
 
@@ -2367,7 +2549,7 @@ def run_batch_fit(
                 )
                 p0_flat = p0[:npq]
                 if fixed_peaks is not None:
-                    p0_plus = add_fixed_peaks(peak_centers = fixed_peaks, x = _x_dev, y = spec_d[i], sig = sig, gam = gam, existing_params=p0_flat[:npq])
+                    p0_plus = add_fixed_peaks(peak_centers = fixed_peaks, x = _x_dev, y = spec_d[i], sig = sig, gam = gam, existing_params=p0_flat[:npq], suppression_windows= suppression_windows)
                     p0_flat_list.append(p0_plus)
                 
                 elif fixed_peaks is None:
