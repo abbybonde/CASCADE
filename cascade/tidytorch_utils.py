@@ -1301,121 +1301,6 @@ def _compute_model_batch(params: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return (amps * pv).sum(dim=1)                       # (B, n_pts)
 
 
-# def _fit_batch_adam(spectra: torch.Tensor,
-#                     x: torch.Tensor,
-#                     p0_batch: torch.Tensor,
-#                     grad_mask: torch.Tensor,
-#                     max_iter: int = 2000,
-#                     tol: float = 1e-5,
-#                     aggressive_start_steps: int = 60,
-#                     aggressive_lr_mult: float = 3.0,
-#                     aggressive_clip_norm: float = 3.0,
-#                     aggressive_beta1: float = 0.85,
-#                     progress_every: int = 0,
-#                     progress_prefix: str = "fit") -> torch.Tensor:
-#     """
-#     Adam optimisation for a whole batch of spectra simultaneously.
-
-#     Matches fit_with_bounded_adam exactly:
-#       - 100-step linear warmup → cosine LR decay to 1e-5
-#       - Per-spectrum gradient clipping (norm ≤ 1.0 per row)
-#       - NaN-safe bounds projection at every step
-
-#     spectra   : (B, n_pts)          — target spectra (denoised)
-#     p0_batch  : (B, max_peaks*4)    — padded initial guesses
-#     grad_mask : (B, max_peaks*4)    — 1.0 for real peaks, 0.0 for padding
-#     returns   : (B, max_peaks*4)    — optimised parameters
-#     """
-#     B, npq = p0_batch.shape
-
-#     # Initial bounds projection with NaN guard
-#     p_init  = p0_batch.reshape(B, -1, 4)
-#     clamped = torch.clamp(p_init, _LO, _HI)
-#     params  = torch.where(torch.isfinite(clamped), clamped, p_init).reshape(B, npq)
-#     params  = params.detach().requires_grad_(True)
-
-#     peak_lr = 1e-2
-#     end_lr  = 1e-5
-#     warmup  = 100
-#     aggressive_steps = int(max(0, min(aggressive_start_steps, max_iter)))
-#     aggressive_lr = min(peak_lr * max(1.0, aggressive_lr_mult), 5e-2)
-
-#     optimizer = torch.optim.Adam([params], lr=peak_lr, betas=(0.9, 0.999), fused=True)
-#     t_fit_start = time.perf_counter()
-
-#     last_loss = float('inf')
-#     for i in range(max_iter):
-#         optimizer.zero_grad()
-
-#         model = _compute_model_batch(params, x)         # (B, n_pts)
-#         loss  = ((model - spectra) ** 2).sum()          # scalar
-#         loss.backward()
-
-#         with torch.no_grad():
-#             # Zero gradients for zero-padded peaks
-#             params.grad.mul_(grad_mask)
-
-#             # Per-spectrum gradient clipping — matches fit_with_bounded_adam.
-#             # Compute L2 norm independently for each spectrum's param block,
-#             # then scale down any row whose norm exceeds 1.0.
-#             g      = params.grad                            # (B, npq)
-#             norms  = g.norm(dim=1, keepdim=True)            # (B, 1)
-#             clip_now = aggressive_clip_norm if i < aggressive_steps else 1.0
-#             scale  = (clip_now / norms.clamp(min=clip_now)) # clip at clip_now
-#             params.grad.mul_(scale)
-
-#         # Aggressive-start schedule:
-#         #   1) aggressive burst for first `aggressive_steps`
-#         #   2) short transition to base peak_lr
-#         #   3) cosine decay to end_lr
-#         if i < aggressive_steps:
-#             lr = aggressive_lr
-#         elif i < aggressive_steps + warmup:
-#             t = (i - aggressive_steps) / max(1, warmup)
-#             lr = aggressive_lr + t * (peak_lr - aggressive_lr)
-#         else:
-#             progress = (i - aggressive_steps - warmup) / max(1, max_iter - aggressive_steps - warmup)
-#             cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
-#             lr       = end_lr + (peak_lr - end_lr) * cosine
-#         for pg in optimizer.param_groups:
-#             pg['lr'] = lr
-#             if i < aggressive_steps:
-#                 pg['betas'] = (aggressive_beta1, 0.999)
-#             else:
-#                 pg['betas'] = (0.9, 0.999)
-
-#         optimizer.step()
-
-#         # Bounds projection with NaN guard
-#         with torch.no_grad():
-#             p_r     = params.data.reshape(B, -1, 4)
-#             clamped = torch.clamp(p_r, _LO, _HI)
-#             params.data = torch.where(
-#                 torch.isfinite(clamped), clamped, p_r
-#             ).reshape(B, npq)
-
-#         if i % 50 == 0:
-#             last_loss = loss.item() / B   # mean per-spectrum loss
-#             if last_loss < tol:
-#                 break
-
-#         if progress_every and progress_every > 0:
-#             step_done = i + 1
-#             if (step_done % progress_every == 0) or (step_done == max_iter):
-#                 elapsed = time.perf_counter() - t_fit_start
-#                 it_per_sec = step_done / max(elapsed, 1e-9)
-#                 eta = (max_iter - step_done) / max(it_per_sec, 1e-9)
-#                 loss_mean = loss.item() / B
-#                 print(
-#                     f"[{progress_prefix}] iter {step_done}/{max_iter} "
-#                     f"({100.0 * step_done / max_iter:.1f}%) | "
-#                     f"loss/pix={loss_mean:.4e} | lr={lr:.2e} | "
-#                     f"elapsed {elapsed:.1f}s | ETA {eta:.1f}s"
-#                 )
-
-#     return params.detach()
-
-
 def _fit_batch_adam(
     spectra: torch.Tensor,
     x: torch.Tensor,
@@ -2562,12 +2447,18 @@ def add_fixed_peaks(
     """
 
     def interp(x_query: float) -> torch.Tensor:
-        idx = torch.searchsorted(x, torch.tensor(x_query, dtype=x.dtype))
+        x_query_t = x.new_tensor(x_query)
+        idx = torch.searchsorted(x, x_query_t)
         idx = idx.clamp(1, x.shape[0] - 1)
         x0, x1 = x[idx - 1], x[idx]
         y0, y1 = y[idx - 1], y[idx]
-        t = (torch.tensor(x_query, dtype=x.dtype) - x0) / (x1 - x0)
+        t = (x_query_t - x0) / (x1 - x0)
         return y0 + t * (y1 - y0)
+
+    def as_x_tensor(value) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.to(device=x.device, dtype=x.dtype)
+        return x.new_tensor(value)
 
     # ------------------------------------------------------------------ #
     # 0. Validate / default suppression windows                           #
@@ -2653,18 +2544,15 @@ def add_fixed_peaks(
         # Blend absorbed peaks: sum amp, amplitude-weighted mean sig/gam      #
         # ------------------------------------------------------------------ #
         amps = torch.stack([
-            p["amp"] if isinstance(p["amp"], torch.Tensor)
-            else torch.tensor(float(p["amp"]), dtype=x.dtype)
+            as_x_tensor(p["amp"])
             for p in all_absorbed
         ])
         sigs = torch.stack([
-            p["sig"] if isinstance(p["sig"], torch.Tensor)
-            else torch.tensor(float(p["sig"]), dtype=x.dtype)
+            as_x_tensor(p["sig"])
             for p in all_absorbed
         ])
         gams = torch.stack([
-            p["gam"] if isinstance(p["gam"], torch.Tensor)
-            else torch.tensor(float(p["gam"]), dtype=x.dtype)
+            as_x_tensor(p["gam"])
             for p in all_absorbed
         ])
 
@@ -2692,12 +2580,12 @@ def add_fixed_peaks(
     # ------------------------------------------------------------------ #
     parts = []
     for peak in resolved:
-        amp = peak["amp"] if isinstance(peak["amp"], torch.Tensor) else torch.tensor(float(peak["amp"]), dtype=x.dtype)
+        amp = as_x_tensor(peak["amp"])
         parts.extend([
             amp,
-            torch.tensor(float(peak["ctr"]), dtype=x.dtype),
-            peak["sig"] if isinstance(peak["sig"], torch.Tensor) else torch.tensor(float(peak["sig"]), dtype=x.dtype),
-            peak["gam"] if isinstance(peak["gam"], torch.Tensor) else torch.tensor(float(peak["gam"]), dtype=x.dtype),
+            x.new_tensor(float(peak["ctr"])),
+            as_x_tensor(peak["sig"]),
+            as_x_tensor(peak["gam"]),
         ])
 
     return torch.stack(parts)
