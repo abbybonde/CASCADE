@@ -2730,6 +2730,10 @@ def run_batch_fit(
     sig: float = 5.0,
     gam: float = 5.0,
     suppression_windows: list[float] | None = None,
+    fitter: str = "adam",
+    varpro_centre_mode: str = "fixed",
+    varpro_ridge_lambda: float = 1e-3,
+    varpro_final_nnls: bool = False,
 ) -> dict:
     """Run the full batch fitting pipeline on a pre-generated spectra array.
 
@@ -2770,6 +2774,14 @@ def run_batch_fit(
     fit_checkpoint_every : Adam progress print cadence (iterations)
     resume           : skip batches whose output files already exist on disk
     save_results     : save final stitched results to ``fit_{name}.pt``
+    fitter           : "adam" [default] or "varpro" — selects between the
+                       joint 4-parameter Adam fit and the variable-projection
+                       fit (`_fit_batch_varpro`)
+    varpro_centre_mode : "fixed" | "free" | "linearized" — only used when
+                       fitter == "varpro"
+    varpro_ridge_lambda : ridge regularisation for the inner amplitude solve
+    varpro_final_nnls : if True, run a final non-negative-amplitude cleanup
+                       pass after the varpro fit converges
 
     Returns
     -------
@@ -2887,19 +2899,34 @@ def run_batch_fit(
                 p0_batch[i, :n_take]              = p0_flat[:n_take]
                 grad_mask[i, : min(n_pk * 4, npq)] = 1.0
 
-            # 3) Batched Adam fit
+            # 3) Batched fit
             _sync_device(_ctx_device)
             t_fit0     = time.perf_counter()
-            params_fit = _fit_batch_adam(
-                spec_d, _x_dev, p0_batch, grad_mask,
-                max_iter=max_iter, tol=tol,
-                aggressive_start_steps=aggr_steps,
-                aggressive_lr_mult=aggr_lr_mult,
-                aggressive_clip_norm=aggr_clip,
-                aggressive_beta1=aggr_beta1,
-                progress_every=fit_checkpoint_every,
-                progress_prefix="fit",
-            )
+            if fitter == "varpro":
+                params_fit = _fit_batch_varpro(
+                    spec_d, _x_dev, p0_batch, grad_mask,
+                    max_iter=max_iter, tol=tol,
+                    centre_mode=varpro_centre_mode,
+                    ridge_lambda=varpro_ridge_lambda,
+                    aggressive_start_steps=aggr_steps,
+                    aggressive_lr_mult=aggr_lr_mult,
+                    aggressive_clip_norm=aggr_clip,
+                    aggressive_beta1=aggr_beta1,
+                    progress_every=fit_checkpoint_every,
+                    progress_prefix="fit",
+                    final_nnls=varpro_final_nnls,
+                )
+            else:
+                params_fit = _fit_batch_adam(
+                    spec_d, _x_dev, p0_batch, grad_mask,
+                    max_iter=max_iter, tol=tol,
+                    aggressive_start_steps=aggr_steps,
+                    aggressive_lr_mult=aggr_lr_mult,
+                    aggressive_clip_norm=aggr_clip,
+                    aggressive_beta1=aggr_beta1,
+                    progress_every=fit_checkpoint_every,
+                    progress_prefix="fit",
+                )
             _sync_device(_ctx_device)
             fit_only_sec = time.perf_counter() - t_fit0
 
