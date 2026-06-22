@@ -406,9 +406,16 @@ voigt_multiscale_transform_jax = voigt_multiscale_transform
 # Optimiser
 # ---------------------------------------------------------------------------
 import math
-@torch.compile(fullgraph=True)
-def pseudo_voigt(x, sigma, gamma):
-    """Thompson-Cox-Hastings approximation — accepts torch tensors."""
+def _pseudo_voigt_eager(x, sigma, gamma):
+    """Same math as `pseudo_voigt`, without torch.compile.
+
+    torch.compile's aot_autograd backend does not support double backward,
+    which the "linearized" centre-projection path in `_fit_batch_varpro`
+    needs (it differentiates the peak shape w.r.t. x once via autograd.grad
+    inside a graph that itself gets backpropped through). Keep an eager copy
+    for that one call site; the compiled `pseudo_voigt` below remains the hot
+    path everywhere else.
+    """
     sigma = torch.clamp(sigma, min=1e-6)
     gamma = torch.clamp(gamma, min=1e-6)
 
@@ -430,6 +437,12 @@ def pseudo_voigt(x, sigma, gamma):
     lorentzian = 1.0 / (1.0 + 4.0 * z**2)
 
     return eta * lorentzian + (1.0 - eta) * gaussian
+
+
+@torch.compile(fullgraph=True)
+def pseudo_voigt(x, sigma, gamma):
+    """Thompson-Cox-Hastings approximation — accepts torch tensors."""
+    return _pseudo_voigt_eager(x, sigma, gamma)
 
 @torch.compile(fullgraph=True)
 def compute_model(p, x):
@@ -1520,6 +1533,266 @@ def _fit_batch_adam(
 
     return params.detach()
 
+
+def _varpro_ridge_solve(Phi: torch.Tensor, y: torch.Tensor, ridge_lambda: float):
+    """Differentiable ridge least-squares via QR (no normal equations).
+
+    Phi : (B, n_pts, n_cols)  design matrix (unit-amplitude peak shapes, etc.)
+    y   : (B, n_pts)          target spectra
+    Solves  min_c  ||Phi c - y||^2 + ridge_lambda * ||c||^2
+    by augmenting Phi with sqrt(ridge_lambda) * I and y with zeros, then doing
+    a reduced QR factorisation + triangular solve. QR/solve_triangular are
+    both differentiable, so backprop through this gives the exact
+    variable-projection gradient w.r.t. whatever produced Phi.
+
+    Returns (coef, residual) where residual is the sum-of-squares fit error
+    against the *original* (un-augmented) y.
+    """
+    B, n_pts, n_cols = Phi.shape
+    eye = torch.eye(n_cols, device=Phi.device, dtype=Phi.dtype).unsqueeze(0).expand(B, -1, -1)
+    Phi_aug = torch.cat([Phi, math.sqrt(ridge_lambda) * eye], dim=1)          # (B, n_pts+n_cols, n_cols)
+    y_aug   = torch.cat([y, torch.zeros(B, n_cols, device=Phi.device, dtype=Phi.dtype)], dim=1)
+
+    Q, R = torch.linalg.qr(Phi_aug, mode="reduced")                          # Q:(B,m,n_cols) R:(B,n_cols,n_cols)
+    rhs  = torch.bmm(Q.transpose(-1, -2), y_aug.unsqueeze(-1))               # (B, n_cols, 1)
+    coef = torch.linalg.solve_triangular(R, rhs, upper=True).squeeze(-1)     # (B, n_cols)
+
+    recon    = torch.bmm(Phi, coef.unsqueeze(-1)).squeeze(-1)                # (B, n_pts)
+    residual = ((recon - y) ** 2).sum()
+    return coef, residual
+
+
+def _fit_batch_varpro(
+    spectra: torch.Tensor,
+    x: torch.Tensor,
+    p0_batch: torch.Tensor,
+    grad_mask: torch.Tensor,
+    max_iter: int = 2000,
+    tol: float = 1e-5,
+    centre_mode: str = "fixed",          # "fixed" | "free" | "linearized"
+    ridge_lambda: float = 1e-3,
+    centre_step_clip: float = 2.0,       # max |delta-centre| per step, "linearized" mode only
+    aggressive_start_steps: int = 60,
+    aggressive_lr_mult: float = 3.0,
+    aggressive_clip_norm: float = 3.0,
+    aggressive_beta1: float = 0.85,
+    progress_every: int = 0,
+    progress_prefix: str = "varpro",
+    final_nnls: bool = False,
+) -> torch.Tensor:
+    """Variable-projection alternative to `_fit_batch_adam`.
+
+    Amplitudes are solved analytically (ridge-regularised QR least squares,
+    see `_varpro_ridge_solve`) every step from the current (centre, sigma,
+    gamma); Adam only ever sees the nonlinear shape parameters, so the
+    optimisation problem it sees is much smaller and better conditioned than
+    the joint 4-parameter-per-peak problem in `_fit_batch_adam`.
+
+    centre_mode:
+      - "fixed"      : centre stays at its initial (CWT) value, never updated.
+      - "free"       : centre is a third Adam-optimised parameter alongside
+                       sigma/gamma (still linear-amplitude-projected).
+      - "linearized" : centre stays out of Adam; instead a second "derivative"
+                       column (d peak / dx) is added to the design matrix each
+                       step, and the small shift delta = -b/a (a = amplitude
+                       coefficient, b = derivative coefficient) is applied to
+                       the centre in closed form, Gauss-Newton style.
+
+    Reuses `_fit_batch_adam`'s LR schedule, gradient clipping/masking
+    convention, and bounds projection. `grad_mask` keeps its existing
+    (B, max_peaks*4) padding convention; only the sigma/gamma (and, in "free"
+    mode, centre) columns of it are consulted.
+
+    Returns (B, max_peaks*4) flat params [amp, ctr, sigma, gamma, ...],
+    matching `_fit_batch_adam`'s output format.
+    """
+    assert centre_mode in ("fixed", "free", "linearized")
+
+    B, npq = p0_batch.shape
+    n_peaks = npq // 4
+
+    # --- Initial bounds projection with NaN guard (matches _fit_batch_adam) ---
+    p_init  = p0_batch.reshape(B, n_peaks, 4)
+    clamped = torch.clamp(p_init, _LO, _HI)
+    p_init  = torch.where(torch.isfinite(clamped), clamped, p_init)
+
+    centres0 = p_init[:, :, 1].detach().clone()            # (B, n_peaks) — initial/fixed centres
+    shape0   = p_init[:, :, 2:4].detach().clone()           # (B, n_peaks, 2) — sigma, gamma
+
+    mask_r     = grad_mask.reshape(B, n_peaks, 4)
+    peak_mask  = mask_r[:, :, 0]                            # (B, n_peaks) — 1.0 for real peaks
+    shape_mask = mask_r[:, :, 2:4].reshape(B, n_peaks * 2)   # sigma+gamma mask
+
+    if centre_mode == "free":
+        # Pack [centre, sigma, gamma] as the Adam-optimised tensor.
+        opt_init  = torch.cat([centres0.unsqueeze(-1), shape0], dim=-1).reshape(B, n_peaks * 3)
+        ctr_mask  = mask_r[:, :, 1]
+        opt_mask  = torch.cat([ctr_mask.unsqueeze(-1), mask_r[:, :, 2:4]], dim=-1).reshape(B, n_peaks * 3)
+    else:
+        opt_init = shape0.reshape(B, n_peaks * 2)
+        opt_mask = shape_mask
+
+    params = opt_init.detach().clone().requires_grad_(True)
+    centres_buf = centres0.clone()   # mutable, non-grad centre buffer for "fixed"/"linearized"
+
+    sig_lo, sig_hi = float(_LO[2]), float(_HI[2])
+    gam_lo, gam_hi = float(_LO[3]), float(_HI[3])
+    ctr_lo, ctr_hi = float(_LO[1]), float(_HI[1])
+
+    def _unpack(p):
+        if centre_mode == "free":
+            p_r = p.reshape(B, n_peaks, 3)
+            return p_r[:, :, 0], p_r[:, :, 1], p_r[:, :, 2]   # centres, sigmas, gammas
+        p_r = p.reshape(B, n_peaks, 2)
+        return centres_buf, p_r[:, :, 0], p_r[:, :, 1]
+
+    def _build_phi(centres, sigmas, gammas, want_deriv):
+        ctrs = centres.unsqueeze(-1)
+        sigs = sigmas.unsqueeze(-1)
+        gams = gammas.unsqueeze(-1)
+        x_s  = x[None, None, :] - ctrs                       # (B, n_peaks, n_pts)
+        if want_deriv:
+            x_s = x_s.detach().requires_grad_(True)
+            # eager (non-torch.compile) path: needed for the double-backward below
+            pv = _pseudo_voigt_eager(x_s, sigs, gams)          # (B, n_peaks, n_pts)
+        else:
+            pv = pseudo_voigt(x_s, sigs, gams)                 # (B, n_peaks, n_pts)
+        if want_deriv:
+            (dpv_dx,) = torch.autograd.grad(pv, x_s, grad_outputs=torch.ones_like(pv), create_graph=True)
+            return pv.transpose(1, 2), dpv_dx.transpose(1, 2)
+        return pv.transpose(1, 2), None
+
+    peak_lr = 1e-2
+    end_lr  = 1e-5
+    warmup  = 100
+    aggressive_steps = int(max(0, min(aggressive_start_steps, max_iter)))
+    aggressive_lr    = min(peak_lr * max(1.0, aggressive_lr_mult), 5e-2)
+
+    lrs    = torch.empty(max_iter, dtype=torch.float32)
+    betas1 = torch.empty(max_iter, dtype=torch.float32)
+    cosine_start = aggressive_steps + warmup
+    for i in range(max_iter):
+        if i < aggressive_steps:
+            lr, b1 = aggressive_lr, aggressive_beta1
+        elif i < aggressive_steps + warmup:
+            t  = (i - aggressive_steps) / max(1, warmup)
+            lr, b1 = aggressive_lr + t * (peak_lr - aggressive_lr), 0.9
+        else:
+            progress = (i - cosine_start) / max(1, max_iter - cosine_start)
+            cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr, b1 = end_lr + (peak_lr - end_lr) * cosine, 0.9
+        lrs[i], betas1[i] = lr, b1
+
+    optimizer = torch.optim.Adam([params], lr=peak_lr, betas=(0.9, 0.999), fused=True)
+    pg = optimizer.param_groups[0]
+
+    t_fit_start = time.perf_counter()
+    last_loss = float("inf")
+    final_amps = None
+
+    for i in range(max_iter):
+        optimizer.zero_grad()
+
+        centres, sigmas, gammas = _unpack(params)
+        want_deriv = (centre_mode == "linearized")
+        Phi, deriv_cols = _build_phi(centres, sigmas, gammas, want_deriv)
+
+        if want_deriv:
+            Phi_full = torch.cat([Phi, deriv_cols], dim=-1)          # (B, n_pts, 2*n_peaks)
+        else:
+            Phi_full = Phi
+
+        coef, loss = _varpro_ridge_solve(Phi_full, spectra, ridge_lambda)
+        loss.backward()
+
+        with torch.no_grad():
+            g = params.grad
+            norms    = g.norm(dim=1, keepdim=True)
+            clip_now = aggressive_clip_norm if i < aggressive_steps else 1.0
+            scale    = clip_now / norms.clamp(min=clip_now)
+            if (norms > clip_now).any():
+                params.grad.mul_(opt_mask * scale)
+            else:
+                params.grad.mul_(opt_mask)
+
+        pg["lr"]    = lrs[i].item()
+        pg["betas"] = (betas1[i].item(), 0.999)
+
+        optimizer.step()
+
+        with torch.no_grad():
+            if centre_mode == "free":
+                p_r = params.data.reshape(B, n_peaks, 3)
+                p_r[:, :, 0].clamp_(ctr_lo, ctr_hi)
+                p_r[:, :, 1].clamp_(sig_lo, sig_hi)
+                p_r[:, :, 2].clamp_(gam_lo, gam_hi)
+            else:
+                p_r = params.data.reshape(B, n_peaks, 2)
+                p_r[:, :, 0].clamp_(sig_lo, sig_hi)
+                p_r[:, :, 1].clamp_(gam_lo, gam_hi)
+
+            if centre_mode == "linearized":
+                amps = coef[:, :n_peaks]
+                b    = coef[:, n_peaks:]
+                delta = -b / (amps.abs() + 1e-6)
+                delta = delta.clamp(-centre_step_clip, centre_step_clip) * peak_mask
+                centres_buf = (centres_buf + delta).clamp(ctr_lo, ctr_hi)
+
+            final_amps = coef[:, :n_peaks] if centre_mode == "linearized" else coef
+
+        if i % 50 == 0:
+            last_loss = loss.item() / B
+            if last_loss < tol:
+                break
+
+        if progress_every and progress_every > 0:
+            step_done = i + 1
+            if step_done % progress_every == 0 or step_done == max_iter:
+                elapsed    = time.perf_counter() - t_fit_start
+                it_per_sec = step_done / max(elapsed, 1e-9)
+                eta        = (max_iter - step_done) / max(it_per_sec, 1e-9)
+                print(
+                    f"[{progress_prefix}] iter {step_done}/{max_iter} "
+                    f"({100.0 * step_done / max_iter:.1f}%) | "
+                    f"loss/pix={loss.item() / B:.4e} | lr={pg['lr']:.2e} | "
+                    f"elapsed {elapsed:.1f}s | ETA {eta:.1f}s"
+                )
+
+    with torch.no_grad():
+        centres, sigmas, gammas = _unpack(params)
+        amps = final_amps if final_amps is not None else torch.zeros(B, n_peaks, device=params.device)
+        amps = amps * peak_mask
+
+        if final_nnls:
+            amps = _nnls_refine_amplitudes(centres, sigmas, gammas, x, spectra, ridge_lambda)
+            amps = amps * peak_mask
+
+        out = torch.stack([amps, centres, sigmas, gammas], dim=-1).reshape(B, npq)
+    return out.detach()
+
+
+def _nnls_refine_amplitudes(centres, sigmas, gammas, x, spectra, ridge_lambda=1e-3):
+    """Optional non-negative amplitude refinement, run once after Adam/VarPro
+    converges. NNLS has no useful gradient, so it is never used inside the
+    optimisation loop — only as a final cleanup pass.
+    """
+    from scipy.optimize import nnls
+
+    B, n_peaks = centres.shape
+    device, dtype = centres.device, centres.dtype
+    x_s = x[None, None, :] - centres.unsqueeze(-1)
+    Phi = pseudo_voigt(x_s, sigmas.unsqueeze(-1), gammas.unsqueeze(-1)).transpose(1, 2)  # (B, n_pts, n_peaks)
+
+    Phi_np = Phi.detach().cpu().numpy()
+    y_np   = spectra.detach().cpu().numpy()
+    amps_out = np.zeros((B, n_peaks), dtype=np.float32)
+    for bi in range(B):
+        try:
+            amps_out[bi], _ = nnls(Phi_np[bi], y_np[bi])
+        except Exception:
+            amps_out[bi] = 0.0
+    return torch.as_tensor(amps_out, device=device, dtype=dtype)
+
 # ── Post-fit analysis ─────────────────────────────────────────────────────────
 
 def estimate_fit_characteristics(spectrum, fitted_params, x, amp_threshold=1e-2):
@@ -1686,7 +1959,9 @@ def _run_sweep(param_name, param_values, n_samples=30, seed=42,
                min_spacing=7.0, max_peaks=200,
                aggressive_start_steps=60, aggressive_lr_mult=3.0,
                aggressive_clip_norm=3.0, aggressive_beta1=0.85,
-               profile=False, return_timing=False):
+               profile=False, return_timing=False,
+               fitter="adam", varpro_centre_mode="fixed", varpro_ridge_lambda=1e-3,
+               varpro_final_nnls=False):
     """
     Fully vectorised sweep. GPU kernel breakdown per level:
       1. Batch denoise       — 1 FFT on (B, n_pts)
@@ -1853,21 +2128,38 @@ def _run_sweep(param_name, param_values, n_samples=30, seed=42,
     else:
         build_p0_sec = 0.0
 
-    # ── 5c. ONE batched Adam call for all spectra in sweep ───────────────────
+    # ── 5c. ONE batched fit call for all spectra in sweep ────────────────────
     if do_timing:
         t0 = time.perf_counter()
-    params_batch = _fit_batch_adam(
-        spec_d,
-        _x_dev,
-        p0_batch,
-        grad_mask,
-        max_iter=max_iter,
-        tol=tol,
-        aggressive_start_steps=aggressive_start_steps,
-        aggressive_lr_mult=aggressive_lr_mult,
-        aggressive_clip_norm=aggressive_clip_norm,
-        aggressive_beta1=aggressive_beta1,
-    )
+    if fitter == "varpro":
+        params_batch = _fit_batch_varpro(
+            spec_d,
+            _x_dev,
+            p0_batch,
+            grad_mask,
+            max_iter=max_iter,
+            tol=tol,
+            centre_mode=varpro_centre_mode,
+            ridge_lambda=varpro_ridge_lambda,
+            aggressive_start_steps=aggressive_start_steps,
+            aggressive_lr_mult=aggressive_lr_mult,
+            aggressive_clip_norm=aggressive_clip_norm,
+            aggressive_beta1=aggressive_beta1,
+            final_nnls=varpro_final_nnls,
+        )
+    else:
+        params_batch = _fit_batch_adam(
+            spec_d,
+            _x_dev,
+            p0_batch,
+            grad_mask,
+            max_iter=max_iter,
+            tol=tol,
+            aggressive_start_steps=aggressive_start_steps,
+            aggressive_lr_mult=aggressive_lr_mult,
+            aggressive_clip_norm=aggressive_clip_norm,
+            aggressive_beta1=aggressive_beta1,
+        )
     if do_timing:
         fit_adam_sec = _elapsed(t0)
     else:
@@ -1990,13 +2282,15 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
              ctr_tol=15.0, min_spacing=7.0, response_threshold=0.02,
              min_scale_votes=6, max_peaks=200,
              aggressive_start_steps=60, aggressive_lr_mult=3.0,
-             aggressive_clip_norm=3.0, aggressive_beta1=0.85):
+             aggressive_clip_norm=3.0, aggressive_beta1=0.85,
+             fitter="adam", varpro_centre_mode="fixed", varpro_ridge_lambda=1e-3,
+             varpro_final_nnls=False):
     """Fit one SampleWrapper spectrum using the cached sweep context.
 
     Requires init_sweep_context() to have been called beforehand.
 
     Runs the full pipeline on a single spectrum:
-      denoise → Lor4 CWT → cross-scale vote → initial guesses → batched Adam
+      denoise → Lor4 CWT → cross-scale vote → initial guesses → batched fit
 
     Parameters
     ----------
@@ -2014,6 +2308,14 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
     aggressive_lr_mult    : LR multiplier during the aggressive phase
     aggressive_clip_norm  : gradient clip norm during the aggressive phase
     aggressive_beta1      : Adam β₁ during the aggressive phase
+    fitter                : "adam" [default] or "varpro" — selects between the
+                            joint 4-parameter Adam fit and the variable-
+                            projection fit (`_fit_batch_varpro`)
+    varpro_centre_mode    : "fixed" | "free" | "linearized" — only used when
+                            fitter == "varpro"
+    varpro_ridge_lambda   : ridge regularisation for the inner amplitude solve
+    varpro_final_nnls     : if True, run a final non-negative-amplitude cleanup
+                            pass after the varpro fit converges
 
     Returns
     -------
@@ -2045,12 +2347,23 @@ def _fit_one(sample_wrapper, max_iter=2000, tol=1e-5, amp_threshold=1e-2,
     p0_batch[0, :min(p0.numel(), npq)] = p0[:npq]
     gmask[0, :n*4]    = 1.0
 
-    params = _fit_batch_adam(spec_d.unsqueeze(0), _x_dev, p0_batch, gmask,
-                             max_iter=max_iter, tol=tol,
-                             aggressive_start_steps=aggressive_start_steps,
-                             aggressive_lr_mult=aggressive_lr_mult,
-                             aggressive_clip_norm=aggressive_clip_norm,
-                             aggressive_beta1=aggressive_beta1).squeeze(0)
+    if fitter == "varpro":
+        params = _fit_batch_varpro(spec_d.unsqueeze(0), _x_dev, p0_batch, gmask,
+                                    max_iter=max_iter, tol=tol,
+                                    centre_mode=varpro_centre_mode,
+                                    ridge_lambda=varpro_ridge_lambda,
+                                    aggressive_start_steps=aggressive_start_steps,
+                                    aggressive_lr_mult=aggressive_lr_mult,
+                                    aggressive_clip_norm=aggressive_clip_norm,
+                                    aggressive_beta1=aggressive_beta1,
+                                    final_nnls=varpro_final_nnls).squeeze(0)
+    else:
+        params = _fit_batch_adam(spec_d.unsqueeze(0), _x_dev, p0_batch, gmask,
+                                 max_iter=max_iter, tol=tol,
+                                 aggressive_start_steps=aggressive_start_steps,
+                                 aggressive_lr_mult=aggressive_lr_mult,
+                                 aggressive_clip_norm=aggressive_clip_norm,
+                                 aggressive_beta1=aggressive_beta1).squeeze(0)
     params = prune_peaks(params, amp_threshold=amp_threshold, wn=_x_dev)
     params = deduplicate_peaks(params, min_spacing)
 
