@@ -1,0 +1,53 @@
+name: csmap
+# Channels: conda-forge first, then defaults.
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # --- interpreter -----------------------------------------------------------
+  # Python 3.14 is the eventual target; conda-forge currently ships 3.12 wheels
+  # for most of the stack. Use 3.12 until 3.14 wheels are broadly available.
+  - python=3.12
+
+  # --- numerical core --------------------------------------------------------
+  - numpy>=2.0
+  - scipy>=1.13
+  - scikit-learn>=1.5
+  - scikit-image>=0.22
+
+  # --- JIT / UMAP stack ------------------------------------------------------
+  - numba>=0.60
+  - umap-learn>=0.5.6
+  - pynndescent>=0.5.13
+
+  # --- interactive visualizer stack ------------------------------------------
+  - holoviews>=1.18
+  - panel>=1.4
+  - bokeh>=3.4
+  - datashader>=0.16
+
+  # --- data I/O --------------------------------------------------------------
+  - h5py>=3.10
+  - dill                # pipeline cache (pickle cannot serialize numba closures)
+  - pyperclip           # clipboard support for pandas.to_clipboard()
+
+  # --- plotting / analysis ---------------------------------------------------
+  - matplotlib>=3.8
+  - pandas>=2.0
+
+  # --- Jupyter ---------------------------------------------------------------
+  - jupyterlab>=4
+  - ipykernel>=6.29     # required for VS Code and JupyterLab kernel registration
+  - ipywidgets>=8.1     # widget infrastructure; keep in sync with panel deps
+  # DO NOT install jupyter_bokeh via pip.
+  # Panel >= 1.0 bundles its own Bokeh integration.
+  # jupyter_bokeh is a legacy package that conflicts with modern Panel.
+
+  # --- pip-only packages -----------------------------------------------------
+  - pip:
+    - hvplot             # HoloViews plotting extensions
+    - tqdm               # progress bars
+    - hypothesis>=6      # property-based testing
+    # Install local packages in editable mode so imports resolve correctly.
+    - "-e ."
