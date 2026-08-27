@@ -30,4 +30,4 @@ fitted_bcars_fit_yeast_20260515_151585xsamples_tol=1e-05
 pyproject.toml
 TOCFig_Peak_Fitting.png 
 dist/fitting_gui.exe
-dist/fitting_gui-0.1.0-py3-none-any.whl
+dist/fitting_gui-0.1.0-py3-none-any.whlbenchmarks/results/
