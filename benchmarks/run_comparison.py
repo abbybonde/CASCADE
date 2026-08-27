@@ -61,7 +61,7 @@ CWT_KW = dict(
 )
 
 
-def _scaled_max_nfev(n_params, per_param=60, cap=4000):
+def _scaled_max_nfev(n_params, per_param=15, cap=1200):
     """Give LM a standard-scaled evaluation budget (~ scipy's own default of
     100*(n+1) for method='lm'), capped so a single pathological spectrum
     cannot dominate the whole benchmark's wall-clock time.

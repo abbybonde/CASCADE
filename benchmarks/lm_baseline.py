@@ -66,7 +66,7 @@ def _residual(p_flat, x, y):
     return compute_model_np(p_flat, x) - y
 
 
-def trim_zero_peaks(p0_flat: np.ndarray, max_peaks: int = 60) -> np.ndarray:
+def trim_zero_peaks(p0_flat: np.ndarray, max_peaks: int = 40) -> np.ndarray:
     """Drop zero-amplitude padding rows from a CASCADE-style flat p0 vector.
 
     Also caps the candidate count at the ``max_peaks`` largest-amplitude
@@ -105,7 +105,7 @@ def lm_fit_from_p0(spectrum: np.ndarray, x: np.ndarray, p0_flat: np.ndarray,
 def naive_initial_guess(spectrum: np.ndarray, x: np.ndarray,
                          height_frac: float = 0.05, distance_pts: int = 4,
                          default_fwhm: float = 15.0, default_gamma: float = 5.0,
-                         max_peaks: int = 60) -> np.ndarray:
+                         max_peaks: int = 40) -> np.ndarray:
     """Conventional single-scale peak-picking initialization (no CWT):
     scipy.signal.find_peaks on the raw, noisy spectrum. Represents the
     standard practice this paper's Introduction critiques (Pezzotti2022,
